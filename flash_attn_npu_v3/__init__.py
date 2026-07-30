@@ -23,6 +23,10 @@ if is_arch22():
         get_scheduler_metadata,
     )
 elif is_arch35():
-    from .interface_arch35 import flash_attn_with_kvcache
+    from .interface_arch35 import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
 else:
     raise RuntimeError(f"Unsupported Ascend device: {torch_npu.npu.get_device_name()}")
