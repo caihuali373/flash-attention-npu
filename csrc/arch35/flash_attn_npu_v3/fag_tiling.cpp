@@ -4,7 +4,7 @@
  * Ascend950-specific host tiling and workspace calculation for FA v3 bwd.
  */
 
-#include "fag_tilingdata.h"
+#include "fag_common.h"
 
 #include <algorithm>
 #include <limits>

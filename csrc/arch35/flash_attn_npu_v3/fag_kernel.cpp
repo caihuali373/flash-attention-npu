@@ -5,15 +5,54 @@
  */
 
 #include "catlass/catlass.hpp"
-#include "fag_tilingdata.h"
+#include "fag_common.h"
 #include "kernel_operator.h"
 
+template <
+    FAGTiling950::Layout INPUT_LAYOUT,
+    bool IS_ATTEN_MASK,
+    bool IS_DTM
+>
+class FlashAttentionScoreGrad950 {
+public:
+    // Methods
+    CATLASS_DEVICE
+    FlashAttentionScoreGrad950() {}
+
+    CATLASS_DEVICE
+    ~FlashAttentionScoreGrad950() {}
+
+    template <int32_t CORE_TYPE = g_coreType>
+    CATLASS_DEVICE
+    void operator()(FAGKernelParams const &params);
+
+    template <>
+    CATLASS_DEVICE
+    void operator()<AscendC::AIC>(FAGKernelParams const &params)
+    {
+    }
+
+    template <>
+    CATLASS_DEVICE
+    void operator()<AscendC::AIV>(FAGKernelParams const &params)
+    {
+    }
+
+private:
+};
+
+template <
+    typename DataType,
+    FAGTiling950::Layout INPUT_LAYOUT,
+    bool IS_CAUSAL,
+    bool IS_DETERMINISTIC>
 CATLASS_GLOBAL void FlashAttentionV3Bwd950(
     GM_ADDR dout,
     GM_ADDR q,
     GM_ADDR k,
     GM_ADDR v,
     GM_ADDR out,
+    GM_ADDR mask,
     GM_ADDR softmax_lse,
     GM_ADDR cu_seqlens_q,
     GM_ADDR cu_seqlens_k,
@@ -23,20 +62,12 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
     GM_ADDR workspace,
     GM_ADDR tiling)
 {
-    auto *fag_tiling =
-        reinterpret_cast<__gm__ FAGTiling950::FAGTilingData *>(tiling);
-    if (AscendC::GetBlockIdx() == 0) {
-        AscendC::printf(
-            "[A5 FAG V3] entered FlashAttentionV3Bwd950, "
-            "block_num=%u layout=%d\n",
-            AscendC::GetBlockNum(), fag_tiling->layout);
-        AscendC::printf("totalQ=%d totalKv=%d N1=%d N2=%d G=%d D1=%d D2=%d\n",
-            fag_tiling->totalQ, fag_tiling->totalKv,
-            fag_tiling->qHeadNum, fag_tiling->kvHeadNum,
-            fag_tiling->groupSize, fag_tiling->qkHeadDim, fag_tiling->vHeadDim);
-    }
+    // TODO: 各个block待补充
 
-    (void)workspace;
-
-    // TODO(arch35-bwd): implement the Ascend950 backward kernel.
+    using FAGKernel950 = FlashAttentionScoreGrad950<
+        INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC>; // TODO: 待补充
+    FAGKernelParams params{dout, q, k, v, out, mask, softmax_lse,
+        cu_seqlens_q, cu_seqlens_k, dq, dk, dv, workspace, tiling};
+    FAGKernel950 fag;
+    fag(params);
 }

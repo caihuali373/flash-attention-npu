@@ -222,10 +222,58 @@ mha_bwd(
         cu_k = ptr(cu_k_device);
     }
 
-    FlashAttentionV3Bwd950<<<aic_num, nullptr, stream>>>(
-        ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), ptr(softmax_lse),
-        cu_q, cu_k, ptr(dq), ptr(dk), ptr(dv),
-        ptr(workspace), ptr(tiling_device));
+    at::Tensor mask_cpu_tensor;
+    at::Tensor mask_npu_tensor;
+    uint8_t* mask = nullptr;
+    if (is_causal) {
+        mask_cpu_tensor = at::triu(
+            at::ones({256, 256}, at::device(c10::kCPU).dtype(at::kByte)), 1)
+            .to(at::Device(at::kPrivateUse1));
+        mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        mask = ptr(mask_npu_tensor);
+    }
+
+#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC)          \
+    FlashAttentionV3Bwd950<                                                     \
+        DTYPE, FAGTiling950::Layout::INPUT_LAYOUT,                              \
+        IS_CAUSAL, IS_DETERMINISTIC><<<aic_num, nullptr, stream>>>(             \
+            ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask,                  \
+            ptr(softmax_lse), cu_q, cu_k, ptr(dq), ptr(dk), ptr(dv),            \
+            ptr(workspace), ptr(tiling_device))
+
+#define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                               \
+    do {                                                                         \
+        if (is_causal) {                                                         \
+            if (deterministic) {                                                 \
+                LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true);                  \
+            } else {                                                             \
+                LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false);                 \
+            }                                                                    \
+        } else {                                                                 \
+            if (deterministic) {                                                 \
+                LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true);                 \
+            } else {                                                             \
+                LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false);                \
+            }                                                                    \
+        }                                                                        \
+    } while (0)
+
+    if (q.dtype() == at::kBFloat16) {
+        if (is_varlen) {
+            DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
+        } else {
+            DISPATCH_BWD950_FLAGS(bfloat16_t, BSND);
+        }
+    } else {
+        if (is_varlen) {
+            DISPATCH_BWD950_FLAGS(half, TND);
+        } else {
+            DISPATCH_BWD950_FLAGS(half, BSND);
+        }
+    }
+
+#undef DISPATCH_BWD950_FLAGS
+#undef LAUNCH_BWD950
 
     at::Tensor softmax_d = is_varlen
         ? at::empty({num_heads, q.size(0)}, q.options().dtype(at::kFloat))

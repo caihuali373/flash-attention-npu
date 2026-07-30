@@ -8,11 +8,14 @@
  * kernel.
  */
 
-#ifndef FLASH_ATTN_NPU_ARCH35_V3_FAG_TILINGDATA_H
-#define FLASH_ATTN_NPU_ARCH35_V3_FAG_TILINGDATA_H
+#ifndef FLASH_ATTN_NPU_ARCH35_V3_FAG_COMMON_H
+#define FLASH_ATTN_NPU_ARCH35_V3_FAG_COMMON_H
 
 #include <cstdint>
 #include <type_traits>
+
+#include "catlass/catlass.hpp"
+#include "kernel_operator.h"
 
 namespace FAGTiling950 {
 
@@ -92,5 +95,60 @@ static_assert(std::is_trivially_copyable_v<FAGTilingData>,
 int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling);
 
 }  // namespace FAGTiling950
+
+// Device-kernel argument bundle. Keep it in this header together with the
+// tiling ABI so the arch35 FAG host and device paths share one ABI definition.
+struct FAGKernelParams {
+    GM_ADDR dout;
+    GM_ADDR q;
+    GM_ADDR k;
+    GM_ADDR v;
+    GM_ADDR out;
+    GM_ADDR attenMask;
+    GM_ADDR softmaxLse;
+    GM_ADDR cuSeqQlen;
+    GM_ADDR cuSeqKvlen;
+    GM_ADDR dq;
+    GM_ADDR dk;
+    GM_ADDR dv;
+    GM_ADDR workspace;
+    GM_ADDR tiling;
+
+    CATLASS_DEVICE
+    FAGKernelParams() = default;
+
+    CATLASS_DEVICE
+    FAGKernelParams(
+        GM_ADDR dout_,
+        GM_ADDR q_,
+        GM_ADDR k_,
+        GM_ADDR v_,
+        GM_ADDR out_,
+        GM_ADDR attenMask_,
+        GM_ADDR softmaxLse_,
+        GM_ADDR cuSeqQlen_,
+        GM_ADDR cuSeqKvlen_,
+        GM_ADDR dq_,
+        GM_ADDR dk_,
+        GM_ADDR dv_,
+        GM_ADDR workspace_,
+        GM_ADDR tiling_)
+        : dout(dout_),
+          q(q_),
+          k(k_),
+          v(v_),
+          out(out_),
+          attenMask(attenMask_),
+          softmaxLse(softmaxLse_),
+          cuSeqQlen(cuSeqQlen_),
+          cuSeqKvlen(cuSeqKvlen_),
+          dq(dq_),
+          dk(dk_),
+          dv(dv_),
+          workspace(workspace_),
+          tiling(tiling_)
+    {
+    }
+};
 
 #endif
