@@ -5,6 +5,11 @@
  */
 
 #include "catlass/catlass.hpp"
+#include "catlass/arch/resource.hpp"
+
+#include "tla/tensor.hpp"
+#include "tla/layout.hpp"
+
 #include "fag_common.h"
 #include "kernel_operator.h"
 
@@ -95,6 +100,40 @@ public:
         waveSize_ =
             static_cast<uint64_t>(coreNum_) * continuousBlockNum_;
         scaleValue_ = tiling_->scaleValue;
+
+        // L1 layout:
+        //   [P ping][P pong][dS ping][dS pong]
+        const uint32_t l1TileBytes =
+            qBlockSize_ * kvBlockSize_ * sizeof(DataType);
+        const uint32_t l1PBaseOffset = 0;
+        const uint32_t l1dSBaseOffset =
+            TASK_PINGPONG * l1TileBytes;
+        for (uint32_t i = 0; i < TASK_PINGPONG; ++i) {
+            l1PTensor[i] =
+                resource.l1Buf.template GetBufferByByte<DataType>(
+                    l1PBaseOffset + i * l1TileBytes);
+            l1dSTensor[i] =
+                resource.l1Buf.template GetBufferByByte<DataType>(
+                    l1dSBaseOffset + i * l1TileBytes);
+        }
+
+        // Per-AIV UB layout:
+        //   [mm1 ping][mm1 pong][mm2 ping][mm2 pong]
+        // Fixpipe SPLIT_M sends half of the logical M rows to each AIV.
+        const uint32_t mAligned = RoundUp(qBlockSize_, 16);
+        const uint32_t mmResTileBytes =
+            (mAligned / 2) * kvBlockSize_ * sizeof(float);
+        const uint32_t ubMm1BaseOffset = 0;
+        const uint32_t ubMm2BaseOffset =
+            TASK_PINGPONG * mmResTileBytes;
+        for (uint32_t i = 0; i < TASK_PINGPONG; ++i) {
+            ubMm1ResTensor[i] =
+                resource.ubBuf.template GetBufferByByte<float>(
+                    ubMm1BaseOffset + i * mmResTileBytes);
+            ubMm2ResTensor[i] =
+                resource.ubBuf.template GetBufferByByte<float>(
+                    ubMm2BaseOffset + i * mmResTileBytes);
+        }
 
         if (batchNum_ != 0 && qBlockSize_ != 0 && kvBlockSize_ != 0) {
             LoadDecoderBatch();
@@ -530,6 +569,9 @@ private:
     }
 #endif
 
+private:
+    Catlass::Arch::Resource<Catlass::Arch::Ascend950> resource;
+
     const __gm__ TilingData *tiling_ = nullptr;
 
     AscendC::GlobalTensor<DataType> doutGm_;
@@ -548,6 +590,11 @@ private:
     AscendC::GlobalTensor<float> dkWorkspaceGm_;
     AscendC::GlobalTensor<float> dvWorkspaceGm_;
     AscendC::GlobalTensor<float> deltaWorkspaceGm_;
+
+    AscendC::LocalTensor<DataType> l1PTensor[TASK_PINGPONG];
+    AscendC::LocalTensor<DataType> l1dSTensor[TASK_PINGPONG];
+    AscendC::LocalTensor<float> ubMm1ResTensor[TASK_PINGPONG];
+    AscendC::LocalTensor<float> ubMm2ResTensor[TASK_PINGPONG];
 
     uint32_t batchNum_ = 0;
     uint32_t qSeqlen_ = 0;
