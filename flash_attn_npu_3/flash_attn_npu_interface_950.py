@@ -153,7 +153,7 @@ def _flash_attn_forward_fake(
 
 
 @_torch_custom_op_wrapper(
-    "flash_attn_npu_arch35_v3_C::_flash_attn_backward",
+    "flash_attn_npu_3_950_C::_flash_attn_backward",
     mutates_args=("dq", "dk", "dv"),
     device_types="npu",
 )
@@ -184,7 +184,7 @@ def _flash_attn_backward(
     dout, q, k, v, out = (
         _maybe_contiguous(x) for x in (dout, q, k, v, out)
     )
-    _, _, _, softmax_d = flash_attn_npu_arch35_v3.bwd(
+    _, _, _, softmax_d = flash_attn_npu_3_950.bwd(
         dout,
         q,
         k,
@@ -211,7 +211,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn_npu_arch35_v3_C::_flash_attn_backward")
+@_torch_register_fake_wrapper("flash_attn_npu_3_950_C::_flash_attn_backward")
 def _flash_attn_backward_fake(
     dout,
     q,
