@@ -19,8 +19,9 @@ import pytest
 import torch
 import torch_npu
 
-if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""):
-    pytest.skip("flash_attn_func / flash_attn_varlen_func not on Ascend950", allow_module_level=True)
+IS_ARCH35 = "Ascend950" in (
+    torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+)
 
 from flash_attn_npu_3 import flash_attn_func, flash_attn_varlen_func
 
@@ -36,6 +37,38 @@ INPUT_LIMIT = 2.0
 DROPOUT_P = 0.0
 GTYPE = torch.float64
 CASE_SEED = 42
+
+
+@pytest.mark.skipif(not IS_ARCH35, reason="Ascend950-only backward scaffold smoke test")
+def test_fa_arch35_bwd_autograd_smoke():
+    q = rand_inputs((1, 8, 2, 128), torch.bfloat16, "npu").requires_grad_(True)
+    k = rand_inputs((1, 8, 1, 128), torch.bfloat16, "npu").requires_grad_(True)
+    v = rand_inputs((1, 8, 1, 128), torch.bfloat16, "npu").requires_grad_(True)
+    out = flash_attn_func(q, k, v, causal=False)
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), torch.ones_like(out))
+    assert dq.shape == q.shape
+    assert dk.shape == k.shape
+    assert dv.shape == v.shape
+    assert torch.count_nonzero(dq) == 0
+    assert torch.count_nonzero(dk) == 0
+    assert torch.count_nonzero(dv) == 0
+
+
+@pytest.mark.skipif(not IS_ARCH35, reason="Ascend950-only varlen backward scaffold smoke test")
+def test_fa_arch35_varlen_bwd_autograd_smoke():
+    q = rand_inputs((8, 2, 128), torch.bfloat16, "npu").requires_grad_(True)
+    k = rand_inputs((8, 1, 128), torch.bfloat16, "npu").requires_grad_(True)
+    v = rand_inputs((8, 1, 128), torch.bfloat16, "npu").requires_grad_(True)
+    cu_q = torch.tensor([0, 8], dtype=torch.int32, device="npu")
+    cu_k = torch.tensor([0, 8], dtype=torch.int32, device="npu")
+    out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, 8, 8, causal=False)
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), torch.ones_like(out))
+    assert dq.shape == q.shape
+    assert dk.shape == k.shape
+    assert dv.shape == v.shape
+    assert torch.count_nonzero(dq) == 0
+    assert torch.count_nonzero(dk) == 0
+    assert torch.count_nonzero(dv) == 0
 
 
 def golden_tolerance(_data_type):
@@ -170,6 +203,7 @@ test_cases_bsnd = [
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap",
     test_cases_bsnd,
 )
+@pytest.mark.skipif(IS_ARCH35, reason="Ascend950 backward kernel is currently a scaffold")
 def test_fa_bsnd_bwd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap,
 ):
@@ -211,6 +245,7 @@ test_cases_bsnd_swa = [
     "is_causal, window_size_left, window_size_right, softcap",
     test_cases_bsnd_swa,
 )
+@pytest.mark.skipif(IS_ARCH35, reason="Ascend950 backward kernel is currently a scaffold")
 def test_fa_bsnd_bwd_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     is_causal, window_size_left, window_size_right, softcap
@@ -253,6 +288,7 @@ test_cases_varlen = [
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap",
     test_cases_varlen,
 )
+@pytest.mark.skipif(IS_ARCH35, reason="Ascend950 backward kernel is currently a scaffold")
 def test_fa_varlen_bwd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap
 ):
@@ -298,6 +334,7 @@ test_cases_varlen_swa = [
     "is_causal, window_size_left, window_size_right, softcap",
     test_cases_varlen_swa,
 )
+@pytest.mark.skipif(IS_ARCH35, reason="Ascend950 backward kernel is currently a scaffold")
 def test_fa_varlen_bwd_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     is_causal, window_size_left, window_size_right, softcap

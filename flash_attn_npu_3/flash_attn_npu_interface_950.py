@@ -151,6 +151,362 @@ def _flash_attn_forward_fake(
     softmax_lse_accum = torch.tensor([], device=q.device)
     return out, softmax_lse, out_accum, softmax_lse_accum
 
+
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_arch35_v3_C::_flash_attn_backward",
+    mutates_args=("dq", "dk", "dv"),
+    device_types="npu",
+)
+def _flash_attn_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+) -> torch.Tensor:
+    dout, q, k, v, out = (
+        _maybe_contiguous(x) for x in (dout, q, k, v, out)
+    )
+    _, _, _, softmax_d = flash_attn_npu_arch35_v3.bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        deterministic,
+        sm_margin,
+    )
+    return softmax_d
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_arch35_v3_C::_flash_attn_backward")
+def _flash_attn_backward_fake(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    seqused_q=None,
+    seqused_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    dq=None,
+    dk=None,
+    dv=None,
+    softmax_scale=None,
+    is_causal=False,
+    window_size_left=-1,
+    window_size_right=-1,
+    softcap=0.0,
+    deterministic=False,
+    sm_margin=0,
+):
+    del (
+        dout, k, v, out, softmax_lse, cu_seqlens_k, seqused_q, seqused_k,
+        max_seqlen_k, softmax_scale, is_causal, window_size_left,
+        window_size_right, softcap, deterministic, sm_margin,
+    )
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q, num_heads = q.shape[:3]
+        return torch.empty(
+            (batch_size, num_heads, seqlen_q),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    return torch.empty(
+        (q.shape[1], q.shape[0]),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+
+def _training_forward(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+):
+    if cu_seqlens_q is None:
+        seqused_k = torch.full(
+            (q.shape[0],),
+            k.shape[1],
+            dtype=torch.int32,
+            device=k.device,
+        )
+    else:
+        seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+
+    return _flash_attn_forward(
+        q,
+        k,
+        v,
+        None, None, None, None,  # k_new, v_new, qv, out
+        cu_seqlens_q,
+        cu_seqlens_k,
+        None,                    # cu_seqlens_k_new
+        None,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        None, None, None,        # page_table, kv_batch_idx, leftpad_k
+        None, None, None,        # rotary
+        None, None, None,        # descales
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0,
+        0.0,
+        True,
+        None,
+        1,
+        None,
+        0,
+    )
+
+
+class FlashAttnFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        qv,
+        q_descale,
+        k_descale,
+        v_descale,
+        window_size,
+        attention_chunk,
+        softcap,
+        num_splits,
+        pack_gqa,
+        deterministic,
+        sm_margin,
+        return_softmax,
+        scheduler_metadata,
+    ):
+        if any(x is not None for x in (qv, q_descale, k_descale, v_descale, scheduler_metadata)):
+            raise NotImplementedError("Ascend950 v3 training scaffold only supports q/k/v inputs")
+        if tuple(window_size) != (-1, -1) or attention_chunk != 0 or softcap != 0.0:
+            raise NotImplementedError("Ascend950 v3 training scaffold does not support SWA, attention_chunk or softcap")
+        if num_splits not in (0, 1) or pack_gqa not in (None, False) or sm_margin != 0:
+            raise NotImplementedError("Ascend950 v3 training scaffold does not support split/pack/sm tuning")
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        out, softmax_lse, _, _ = _training_forward(
+            q, k, v, None, None, None, None, softmax_scale, causal
+        )
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.deterministic = deterministic
+        ctx.sm_margin = sm_margin
+        return (out, softmax_lse) if return_softmax else out
+
+    @staticmethod
+    def backward(ctx, dout, *unused_grads):
+        q, k, v, out, softmax_lse = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _flash_attn_backward(
+            dout, q, k, v, out, softmax_lse,
+            None, None, None, None, None, None,
+            dq, dk, dv,
+            ctx.softmax_scale,
+            ctx.causal,
+            -1, -1, 0.0,
+            ctx.deterministic,
+            ctx.sm_margin,
+        )
+        return dq, dk, dv, *((None,) * 15)
+
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+        qv,
+        q_descale,
+        k_descale,
+        v_descale,
+        window_size,
+        attention_chunk,
+        softcap,
+        num_splits,
+        pack_gqa,
+        deterministic,
+        sm_margin,
+        return_softmax,
+        scheduler_metadata,
+    ):
+        if any(x is not None for x in (
+            seqused_q, seqused_k, qv, q_descale, k_descale, v_descale,
+            scheduler_metadata,
+        )):
+            raise NotImplementedError("Ascend950 v3 varlen training scaffold does not support optional tensor inputs")
+        if tuple(window_size) != (-1, -1) or attention_chunk != 0 or softcap != 0.0:
+            raise NotImplementedError("Ascend950 v3 training scaffold does not support SWA, attention_chunk or softcap")
+        if num_splits not in (0, 1) or pack_gqa not in (None, False) or sm_margin != 0:
+            raise NotImplementedError("Ascend950 v3 training scaffold does not support split/pack/sm tuning")
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        out, softmax_lse, _, _ = _training_forward(
+            q, k, v,
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
+            softmax_scale, causal,
+        )
+        ctx.save_for_backward(
+            q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k
+        )
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.deterministic = deterministic
+        ctx.sm_margin = sm_margin
+        return (out, softmax_lse) if return_softmax else out
+
+    @staticmethod
+    def backward(ctx, dout, *unused_grads):
+        q, k, v, out, softmax_lse, cu_q, cu_k = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _flash_attn_backward(
+            dout, q, k, v, out, softmax_lse,
+            cu_q, cu_k, None, None,
+            ctx.max_seqlen_q, ctx.max_seqlen_k,
+            dq, dk, dv,
+            ctx.softmax_scale,
+            ctx.causal,
+            -1, -1, 0.0,
+            ctx.deterministic,
+            ctx.sm_margin,
+        )
+        return dq, dk, dv, *((None,) * 21)
+
+
+def flash_attn_func(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+    scheduler_metadata=None,
+):
+    return FlashAttnFunc.apply(
+        q, k, v, softmax_scale, causal, qv,
+        q_descale, k_descale, v_descale,
+        window_size, attention_chunk, softcap,
+        num_splits, pack_gqa, deterministic, sm_margin,
+        return_attn_probs, scheduler_metadata,
+    )
+
+
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqused_q=None,
+    seqused_k=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+    scheduler_metadata=None,
+):
+    return FlashAttnVarlenFunc.apply(
+        q, k, v, cu_seqlens_q, cu_seqlens_k,
+        seqused_q, seqused_k,
+        max_seqlen_q, max_seqlen_k,
+        softmax_scale, causal, qv,
+        q_descale, k_descale, v_descale,
+        window_size, attention_chunk, softcap,
+        num_splits, pack_gqa, deterministic, sm_margin,
+        return_attn_probs, scheduler_metadata,
+    )
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
