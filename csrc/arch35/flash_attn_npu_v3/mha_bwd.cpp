@@ -159,6 +159,17 @@ mha_bwd(
         const int32_t *kv_lengths = cu_k_cpu.data_ptr<int32_t>();
         TORCH_CHECK(q_lengths[0] == 0 && kv_lengths[0] == 0,
                     "Ascend950 v3 bwd: cu_seqlens must start at zero");
+        for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+            TORCH_CHECK(
+                q_lengths[batch_idx + 1] >= q_lengths[batch_idx] &&
+                    kv_lengths[batch_idx + 1] >= kv_lengths[batch_idx],
+                "Ascend950 v3 bwd: cu_seqlens must be nondecreasing");
+            TORCH_CHECK(
+                q_lengths[batch_idx + 1] - q_lengths[batch_idx] <= q_seqlen &&
+                    kv_lengths[batch_idx + 1] - kv_lengths[batch_idx] <=
+                        kv_seqlen,
+                "Ascend950 v3 bwd: an actual sequence length exceeds max_seqlen");
+        }
         TORCH_CHECK(q_lengths[batch_size] ==
                         static_cast<int64_t>(fag_info.totalQ) &&
                     kv_lengths[batch_size] ==

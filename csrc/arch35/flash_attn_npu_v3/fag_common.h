@@ -19,10 +19,10 @@
 
 namespace FAGTiling950 {
 
-constexpr uint32_t FAG_TILING_ABI_VERSION = 1;
 constexpr uint64_t GM_ALIGNMENT = 512;
 constexpr uint64_t MULTI_CORE_SYNC_BYTES = 64 * 1024;
 constexpr uint32_t SOFTMAX_REDUCE_FLOATS = 8;
+constexpr uint32_t DEFAULT_CONTINUOUS_BLOCK_NUM = 2;
 
 enum class Layout : uint32_t {
     BSND = 0,
@@ -51,6 +51,7 @@ struct FAGInfo {
 
     uint32_t aicNum = 0;
     uint32_t aivNum = 0;
+    uint32_t continuousBlockNum = DEFAULT_CONTINUOUS_BLOCK_NUM;
     uint64_t ubSize = 0;
     float scaleValue = 1.0f;
 };
@@ -62,6 +63,8 @@ struct FAGTilingData {
     uint32_t aicNum = 0;
     uint32_t aivNum = 0;
     uint32_t usedCoreNum = 0;
+    uint32_t continuousBlockNum = DEFAULT_CONTINUOUS_BLOCK_NUM;
+    uint32_t reserved0 = 0;
 
     uint64_t ubSize = 0;
     uint64_t batch = 0;
@@ -75,7 +78,7 @@ struct FAGTilingData {
     uint64_t qkHeadDim = 0;
     uint64_t vHeadDim = 0;
     float scaleValue = 1.0f;
-    uint32_t reserved = 0;
+    uint32_t reserved1 = 0;
 
     uint32_t qTile = 0;
     uint32_t kvTile = 0;
@@ -95,6 +98,31 @@ static_assert(std::is_trivially_copyable_v<FAGTilingData>,
 int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling);
 
 }  // namespace FAGTiling950
+
+struct FAGBlockInfo {
+    uint64_t blockId = 0;
+    uint64_t taskId = 0;
+    uint32_t issueRound = 0;
+    uint32_t issueLane = 0;
+
+    uint32_t batchIdx = 0;
+    uint32_t n2Idx = 0;
+    uint32_t groupIdx = 0;
+    uint32_t s1BlockIdx = 0;
+    uint32_t s2BlockIdx = 0;
+
+    uint32_t s1Start = 0;
+    uint32_t s2Start = 0;
+    uint32_t s1Extend = 0;
+    uint32_t s2Extend = 0;
+
+    uint64_t totalS1Start = 0;
+    uint64_t totalS2Start = 0;
+    uint64_t qOffset = 0;
+    uint64_t kOffset = 0;
+    uint64_t vOffset = 0;
+    uint64_t doutOffset = 0;
+};
 
 // Device-kernel argument bundle. Keep it in this header together with the
 // tiling ABI so the arch35 FAG host and device paths share one ABI definition.

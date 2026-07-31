@@ -22,7 +22,7 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
         info.totalQ == 0 || info.totalKv == 0 || info.qHeadNum == 0 ||
         info.kvHeadNum == 0 || info.qHeadNum % info.kvHeadNum != 0 ||
         info.qkHeadDim == 0 || info.vHeadDim == 0 || info.aicNum == 0 ||
-        info.aivNum == 0 || info.ubSize == 0) {
+        info.aivNum == 0 || info.continuousBlockNum == 0 || info.ubSize == 0) {
         return -1;
     }
 
@@ -32,6 +32,7 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
     tiling.deterministic = info.deterministic;
     tiling.aicNum = info.aicNum;
     tiling.aivNum = info.aivNum;
+    tiling.continuousBlockNum = info.continuousBlockNum;
     tiling.ubSize = info.ubSize;
     tiling.batch = info.batch;
     tiling.qSeqlen = info.qSeqlen;

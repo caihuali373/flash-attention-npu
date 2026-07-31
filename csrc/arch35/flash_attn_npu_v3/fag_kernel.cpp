@@ -9,6 +9,7 @@
 #include "kernel_operator.h"
 
 template <
+    typename DataType,
     FAGTiling950::Layout INPUT_LAYOUT,
     bool IS_ATTEN_MASK,
     bool IS_DTM
@@ -22,23 +23,451 @@ public:
     CATLASS_DEVICE
     ~FlashAttentionScoreGrad950() {}
 
-    template <int32_t CORE_TYPE = g_coreType>
     CATLASS_DEVICE
-    void operator()(FAGKernelParams const &params);
-
-    template <>
-    CATLASS_DEVICE
-    void operator()<AscendC::AIC>(FAGKernelParams const &params)
+    void Init(FAGKernelParams const &params)
     {
+        tiling_ = reinterpret_cast<const __gm__ TilingData *>(params.tiling);
+
+        doutGm_.SetGlobalBuffer((__gm__ DataType *)params.dout);
+        qGm_.SetGlobalBuffer((__gm__ DataType *)params.q);
+        kGm_.SetGlobalBuffer((__gm__ DataType *)params.k);
+        vGm_.SetGlobalBuffer((__gm__ DataType *)params.v);
+        outGm_.SetGlobalBuffer((__gm__ DataType *)params.out);
+        attenMaskGm_.SetGlobalBuffer((__gm__ uint8_t *)params.attenMask);
+        softmaxLseGm_.SetGlobalBuffer((__gm__ float *)params.softmaxLse);
+        cuSeqQGm_.SetGlobalBuffer((__gm__ int32_t *)params.cuSeqQlen);
+        cuSeqKvGm_.SetGlobalBuffer((__gm__ int32_t *)params.cuSeqKvlen);
+        dqGm_.SetGlobalBuffer((__gm__ DataType *)params.dq);
+        dkGm_.SetGlobalBuffer((__gm__ DataType *)params.dk);
+        dvGm_.SetGlobalBuffer((__gm__ DataType *)params.dv);
+
+        dqWorkspaceGm_.SetGlobalBuffer(
+            (__gm__ float *)(params.workspace + tiling_->dqOffset));
+        dkWorkspaceGm_.SetGlobalBuffer(
+            (__gm__ float *)(params.workspace + tiling_->dkOffset));
+        dvWorkspaceGm_.SetGlobalBuffer(
+            (__gm__ float *)(params.workspace + tiling_->dvOffset));
+        deltaWorkspaceGm_.SetGlobalBuffer(
+            (__gm__ float *)(params.workspace + tiling_->deltaOffset));
+
+        batchNum_ = static_cast<uint32_t>(tiling_->batch);
+        qSeqlen_ = static_cast<uint32_t>(tiling_->qSeqlen);
+        kvSeqlen_ = static_cast<uint32_t>(tiling_->kvSeqlen);
+        qHeadNum_ = tiling_->qHeadNum;
+        kvHeadNum_ = tiling_->kvHeadNum;
+        groupNum_ = static_cast<uint32_t>(tiling_->groupSize);
+        qkHeadDim_ = tiling_->qkHeadDim;
+        vHeadDim_ = tiling_->vHeadDim;
+        qBlockSize_ = tiling_->qTile;
+        kvBlockSize_ = tiling_->kvTile;
+        coreNum_ = tiling_->usedCoreNum;
+        continuousBlockNum_ = tiling_->continuousBlockNum;
+        waveSize_ =
+            static_cast<uint64_t>(coreNum_) * continuousBlockNum_;
+        scaleValue_ = tiling_->scaleValue;
+
+        if (batchNum_ != 0 && qBlockSize_ != 0 && kvBlockSize_ != 0) {
+            LoadDecoderBatch();
+        }
     }
 
-    template <>
     CATLASS_DEVICE
-    void operator()<AscendC::AIV>(FAGKernelParams const &params)
+    void operator()(FAGKernelParams const &params)
     {
+        Init(params);
+        uint32_t coreIdx = 0;
+        uint32_t subBlockIdx = 0;
+#ifdef __DAV_CUBE__
+        coreIdx = AscendC::GetBlockIdx();
+#endif
+#ifdef __DAV_VEC__
+        const uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        const uint32_t vectorBlockIdx = AscendC::GetBlockIdx();
+        coreIdx = vectorBlockIdx / subBlockNum;
+        subBlockIdx = vectorBlockIdx % subBlockNum;
+#endif
+        RunTasks(coreIdx, subBlockIdx);
     }
 
 private:
+    using TilingData = FAGTiling950::FAGTilingData;
+
+    CATLASS_DEVICE
+    void GetBatchShape(
+        uint32_t batchIdx,
+        uint64_t &qBatchStart,
+        uint64_t &kvBatchStart,
+        uint32_t &s1Length,
+        uint32_t &s2Length)
+    {
+        if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+            const uint64_t qEnd =
+                static_cast<uint64_t>(cuSeqQGm_.GetValue(batchIdx));
+            const uint64_t kvEnd =
+                static_cast<uint64_t>(cuSeqKvGm_.GetValue(batchIdx));
+            qBatchStart =
+                batchIdx == 0
+                    ? 0
+                    : static_cast<uint64_t>(
+                          cuSeqQGm_.GetValue(batchIdx - 1));
+            kvBatchStart =
+                batchIdx == 0
+                    ? 0
+                    : static_cast<uint64_t>(
+                          cuSeqKvGm_.GetValue(batchIdx - 1));
+            s1Length = static_cast<uint32_t>(qEnd - qBatchStart);
+            s2Length = static_cast<uint32_t>(kvEnd - kvBatchStart);
+        } else {
+            s1Length = qSeqlen_;
+            s2Length = kvSeqlen_;
+            qBatchStart = static_cast<uint64_t>(batchIdx) * s1Length;
+            kvBatchStart = static_cast<uint64_t>(batchIdx) * s2Length;
+        }
+    }
+
+    CATLASS_DEVICE
+    uint32_t FirstValidS1Block(
+        uint32_t s1Length,
+        uint32_t s2Length,
+        uint32_t s2BlockIdx)
+    {
+        if constexpr (!IS_ATTEN_MASK) {
+            return 0;
+        }
+
+        // floor((s2BlockIdx * kvBlockSize - (s2Length - s1Length)) /
+        //       qBlockSize), clamped to [0, ceil(s1Length / qBlockSize)].
+        const int64_t numerator =
+            static_cast<int64_t>(s2BlockIdx) * kvBlockSize_ -
+            (static_cast<int64_t>(s2Length) - s1Length);
+        if (numerator <= 0) {
+            return 0;
+        }
+        const uint32_t s1BlockNum =
+            static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+        return Min(
+            static_cast<uint32_t>(numerator / qBlockSize_), s1BlockNum);
+    }
+
+    CATLASS_DEVICE
+    uint64_t CountValidS1Blocks(
+        uint32_t s1Length,
+        uint32_t s2Length,
+        uint32_t s2BlockNum)
+    {
+        const uint32_t s1BlockNum =
+            static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+        uint64_t count = 0;
+        for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum;
+             ++s2BlockIdx) {
+            count += s1BlockNum -
+                FirstValidS1Block(
+                    s1Length, s2Length, s2BlockIdx);
+        }
+        return count;
+    }
+
+    CATLASS_DEVICE
+    void LoadDecoderBatch()
+    {
+        GetBatchShape(
+            decoderBatchIdx_,
+            decoderQBatchStart_, decoderKvBatchStart_,
+            decoderS1Length_, decoderS2Length_);
+        decoderS1BlockNum_ = static_cast<uint32_t>(
+            CeilDiv(decoderS1Length_, qBlockSize_));
+        decoderS2BlockNum_ = static_cast<uint32_t>(
+            CeilDiv(decoderS2Length_, kvBlockSize_));
+        decoderValidS1PerN2_ = CountValidS1Blocks(
+            decoderS1Length_, decoderS2Length_, decoderS2BlockNum_);
+        decoderBatchBlockNum_ =
+            kvHeadNum_ * groupNum_ *
+            decoderValidS1PerN2_;
+        decoderN2Idx_ = 0;
+        decoderS2BlockIdx_ = 0;
+        decoderS2BlockBegin_ = 0;
+    }
+
+    CATLASS_DEVICE
+    void FillBlockInfo(
+        uint64_t blockId,
+        uint32_t n2Idx,
+        uint32_t groupIdx,
+        uint32_t s1BlockIdx,
+        FAGBlockInfo &block)
+    {
+        const uint32_t s1Start = s1BlockIdx * qBlockSize_;
+        const uint32_t s2Start = decoderS2BlockIdx_ * kvBlockSize_;
+        const uint64_t totalS1Start =
+            decoderQBatchStart_ + s1Start;
+        const uint64_t totalS2Start =
+            decoderKvBatchStart_ + s2Start;
+        const uint64_t qHeadIdx =
+            static_cast<uint64_t>(n2Idx) * groupNum_ + groupIdx;
+
+        block.blockId = blockId;
+        block.batchIdx = decoderBatchIdx_;
+        block.n2Idx = n2Idx;
+        block.groupIdx = groupIdx;
+        block.s1BlockIdx = s1BlockIdx;
+        block.s2BlockIdx = decoderS2BlockIdx_;
+        block.s1Start = s1Start;
+        block.s2Start = s2Start;
+        block.s1Extend =
+            Min(qBlockSize_, decoderS1Length_ - s1Start);
+        block.s2Extend =
+            Min(kvBlockSize_, decoderS2Length_ - s2Start);
+        block.totalS1Start = totalS1Start;
+        block.totalS2Start = totalS2Start;
+        block.qOffset =
+            (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
+        block.kOffset =
+            (totalS2Start * kvHeadNum_ + n2Idx) * qkHeadDim_;
+        block.vOffset =
+            (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
+        block.doutOffset =
+            (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
+    }
+
+    CATLASS_DEVICE
+    bool DecodeBlock(
+        uint64_t blockId,
+        FAGBlockInfo &block)
+    {
+        // ------------bIdx------------
+        while (decoderBatchIdx_ < batchNum_ &&
+               blockId >= decoderBatchBlockBegin_ + decoderBatchBlockNum_) {
+            decoderBatchBlockBegin_ += decoderBatchBlockNum_;
+            ++decoderBatchIdx_;
+            if (decoderBatchIdx_ < batchNum_) {
+                LoadDecoderBatch();
+            }
+        }
+        if (decoderBatchIdx_ >= batchNum_) {
+            return false;
+        }
+        // ------------n2Idx------------
+        const uint64_t blockNumPerN2 =
+            static_cast<uint64_t>(groupNum_) * decoderValidS1PerN2_;
+        const uint64_t blockInBatch =
+            blockId - decoderBatchBlockBegin_;
+        const uint32_t n2Idx =
+            static_cast<uint32_t>(blockInBatch / blockNumPerN2);
+        const uint64_t blockInN2 = blockInBatch % blockNumPerN2;
+        if (n2Idx != decoderN2Idx_) {
+            decoderN2Idx_ = n2Idx;
+            decoderS2BlockIdx_ = 0;
+            decoderS2BlockBegin_ = 0;
+        }
+        // ------------s2Idx------------
+        uint32_t firstValidS1 = 0;
+        uint32_t validS1Num = 0;
+        while (decoderS2BlockIdx_ < decoderS2BlockNum_) {
+            firstValidS1 = FirstValidS1Block(
+                decoderS1Length_, decoderS2Length_,
+                decoderS2BlockIdx_);
+            validS1Num = decoderS1BlockNum_ - firstValidS1;
+            const uint64_t s2BlockTasks =
+                static_cast<uint64_t>(groupNum_) * validS1Num;
+            if (blockInN2 <
+                decoderS2BlockBegin_ + s2BlockTasks) {
+                break;
+            }
+            decoderS2BlockBegin_ += s2BlockTasks;
+            ++decoderS2BlockIdx_;
+        }
+        if (decoderS2BlockIdx_ >= decoderS2BlockNum_) {
+            return false;
+        }
+        // ------------gIdx & s1Idx------------
+        const uint64_t blockInS2 =
+            blockInN2 - decoderS2BlockBegin_;
+        const uint32_t groupIdx =
+            static_cast<uint32_t>(blockInS2 / validS1Num);
+        const uint32_t s1BlockIdx =
+            firstValidS1 +
+            static_cast<uint32_t>(blockInS2 % validS1Num);
+        FillBlockInfo(
+            blockId, n2Idx, groupIdx, s1BlockIdx, block);
+        return true;
+    }
+
+    CATLASS_DEVICE
+    void RunTasks(
+        uint32_t coreIdx,
+        uint32_t subBlockIdx)
+    {
+        if (coreIdx >= coreNum_ || coreNum_ == 0 ||
+            continuousBlockNum_ == 0 ||
+            qBlockSize_ == 0 || kvBlockSize_ == 0) {
+            return;
+        }
+
+        uint64_t taskId = 0;
+        for (uint32_t issueRound = 0;; ++issueRound) {
+            const uint64_t blockBegin =
+                static_cast<uint64_t>(issueRound) * waveSize_ +
+                static_cast<uint64_t>(coreIdx) * continuousBlockNum_;
+
+            for (uint32_t issueLane = 0;
+                 issueLane < continuousBlockNum_; ++issueLane) {
+                FAGBlockInfo block{};
+                if (!DecodeBlock(blockBegin + issueLane, block)) {
+                    if (taskId != 0) {
+                        // no more task to complete, consume last block and finish
+#ifdef __DAV_CUBE__
+                        WaitV1Ready(previousBlock_);
+                        ProcessC2Task(previousBlock_);
+#endif
+#ifdef __DAV_VEC__
+                        WaitC1Ready(previousBlock_, subBlockIdx);
+                        ProcessV1Task(previousBlock_, subBlockIdx);
+                        SetV1Ready(previousBlock_, subBlockIdx);
+#endif
+                    }
+                    return;
+                }
+                block.taskId = taskId;
+                block.issueRound = issueRound;
+                block.issueLane = issueLane;
+
+#ifdef __DAV_CUBE__
+                // C1(i) overlaps V1/C2(i - 1).
+                ProcessC1Task(block);
+                SetC1Ready(block);
+                if (taskId != 0) {
+                    WaitV1Ready(previousBlock_);
+                    ProcessC2Task(previousBlock_);
+                }
+#endif
+#ifdef __DAV_VEC__
+                if (taskId != 0) {
+                    WaitC1Ready(previousBlock_, subBlockIdx);
+                    ProcessV1Task(previousBlock_, subBlockIdx);
+                    SetV1Ready(previousBlock_, subBlockIdx);
+                }
+#endif
+
+                previousBlock_ = block;
+                ++taskId;
+            }
+        }
+    }
+
+#ifdef __DAV_CUBE__
+    CATLASS_DEVICE
+    void SetC1Ready(FAGBlockInfo const &block)
+    {
+        // TODO: AIC sets C1-ready flags for both AIV sub-blocks.
+        // block.taskId can select the ping-pong flag slot.
+        (void)block;
+    }
+
+    CATLASS_DEVICE
+    void WaitV1Ready(FAGBlockInfo const &block)
+    {
+        // TODO: AIC waits for V1-ready from both AIV sub-blocks.
+        (void)block;
+    }
+
+    CATLASS_DEVICE
+    void ProcessC1Task(FAGBlockInfo const &block)
+    {
+        // TODO: Run C1 for this block.
+        (void)block;
+    }
+
+    CATLASS_DEVICE
+    void ProcessC2Task(FAGBlockInfo const &block)
+    {
+        // TODO: Run C2 for this block.
+        (void)block;
+    }
+#endif
+
+#ifdef __DAV_VEC__
+    CATLASS_DEVICE
+    void WaitC1Ready(
+        FAGBlockInfo const &block,
+        uint32_t subBlockIdx)
+    {
+        // TODO: Each AIV waits for its C1-ready flag.
+        (void)block;
+        (void)subBlockIdx;
+    }
+
+    CATLASS_DEVICE
+    void SetV1Ready(
+        FAGBlockInfo const &block,
+        uint32_t subBlockIdx)
+    {
+        // TODO: Each AIV publishes its V1-ready flag to AIC.
+        (void)block;
+        (void)subBlockIdx;
+    }
+
+    CATLASS_DEVICE
+    void ProcessV1Task(
+        FAGBlockInfo const &block,
+        uint32_t subBlockIdx)
+    {
+        // TODO: Run V1 for this block.
+        // Both AIV sub-blocks process the same block and split vector work.
+        (void)block;
+        (void)subBlockIdx;
+    }
+#endif
+
+    const __gm__ TilingData *tiling_ = nullptr;
+
+    AscendC::GlobalTensor<DataType> doutGm_;
+    AscendC::GlobalTensor<DataType> qGm_;
+    AscendC::GlobalTensor<DataType> kGm_;
+    AscendC::GlobalTensor<DataType> vGm_;
+    AscendC::GlobalTensor<DataType> outGm_;
+    AscendC::GlobalTensor<uint8_t> attenMaskGm_;
+    AscendC::GlobalTensor<float> softmaxLseGm_;
+    AscendC::GlobalTensor<int32_t> cuSeqQGm_;
+    AscendC::GlobalTensor<int32_t> cuSeqKvGm_;
+    AscendC::GlobalTensor<DataType> dqGm_;
+    AscendC::GlobalTensor<DataType> dkGm_;
+    AscendC::GlobalTensor<DataType> dvGm_;
+    AscendC::GlobalTensor<float> dqWorkspaceGm_;
+    AscendC::GlobalTensor<float> dkWorkspaceGm_;
+    AscendC::GlobalTensor<float> dvWorkspaceGm_;
+    AscendC::GlobalTensor<float> deltaWorkspaceGm_;
+
+    uint32_t batchNum_ = 0;
+    uint32_t qSeqlen_ = 0;
+    uint32_t kvSeqlen_ = 0;
+    uint64_t qHeadNum_ = 0;
+    uint64_t kvHeadNum_ = 0;
+    uint32_t groupNum_ = 0;
+    uint64_t qkHeadDim_ = 0;
+    uint64_t vHeadDim_ = 0;
+    uint32_t qBlockSize_ = 0;
+    uint32_t kvBlockSize_ = 0;
+    uint32_t coreNum_ = 0;
+    uint32_t continuousBlockNum_ = 0;
+    uint64_t waveSize_ = 0;
+    float scaleValue_ = 1.0f;
+
+    uint32_t decoderBatchIdx_ = 0;
+    uint64_t decoderBatchBlockBegin_ = 0;
+    uint64_t decoderBatchBlockNum_ = 0;
+    uint64_t decoderQBatchStart_ = 0;
+    uint64_t decoderKvBatchStart_ = 0;
+    uint32_t decoderS1Length_ = 0;
+    uint32_t decoderS2Length_ = 0;
+    uint32_t decoderS1BlockNum_ = 0;
+    uint32_t decoderS2BlockNum_ = 0;
+    uint64_t decoderValidS1PerN2_ = 0;
+
+    uint32_t decoderN2Idx_ = 0;
+    uint32_t decoderS2BlockIdx_ = 0;
+    uint64_t decoderS2BlockBegin_ = 0;
+
+    FAGBlockInfo previousBlock_{};
 };
 
 template <
@@ -65,7 +494,7 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
     // TODO: 各个block待补充
 
     using FAGKernel950 = FlashAttentionScoreGrad950<
-        INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC>; // TODO: 待补充
+        DataType, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC>;
     FAGKernelParams params{dout, q, k, v, out, mask, softmax_lse,
         cu_seqlens_q, cu_seqlens_k, dq, dk, dv, workspace, tiling};
     FAGKernel950 fag;
