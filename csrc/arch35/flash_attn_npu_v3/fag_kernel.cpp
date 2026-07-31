@@ -8,6 +8,36 @@
 #include "fag_common.h"
 #include "kernel_operator.h"
 
+static constexpr uint32_t TASK_PINGPONG = 2;
+static constexpr uint8_t CROSS_CORE_SYNC_MODE = 4;
+static constexpr uint16_t V0_V1_FLAG_ID_OFFSET = 16;
+static constexpr uint16_t SYNC_C1_TO_V1_FLAG[TASK_PINGPONG] = {0, 1};
+static constexpr uint16_t SYNC_C2_TO_V2_FLAG[TASK_PINGPONG] = {2, 3};
+static constexpr uint16_t SYNC_V2_TO_C34_FLAG = 4;
+static constexpr uint16_t SYNC_V1_TO_C5_FLAG = 5;
+static constexpr uint16_t SYNC_C34_TO_V2_FLAG = 8;
+static constexpr uint16_t SYNC_C5_TO_V1_FLAG = 9;
+
+/*
+ * FAG arch35 task pipeline and L1-buffer ownership:
+ *
+ *   C1: mm(Q, K^T)
+ *       -- C1_TO_V1[taskId % 2] -->
+ *   V1: scaledMaskSoftmax
+ *       -- V1_TO_C5 --> C5: mm(P^T, dY)
+ *       <-- C5_TO_V1 -- return the P L1 buffer
+ *
+ *   C2: mm(dY, V^T)
+ *       -- C2_TO_V2[taskId % 2] -->
+ *   V2: dS
+ *       -- V2_TO_C34 --> C3: mm(dS, K) and C4: mm(dS^T, Q)
+ *       <-- C34_TO_V2 -- return the dS L1 buffer
+ *
+ * In steady state, C1/C2 of task i overlap V1/V2/C5/C3/C4 of task i - 1.
+ * C1/C2 completion flags use taskId % TASK_PINGPONG. P and dS L1 buffers
+ * use a forward ready flag plus a reverse return flag to enforce ownership.
+ */
+
 template <
     typename DataType,
     FAGTiling950::Layout INPUT_LAYOUT,
@@ -85,8 +115,27 @@ public:
         const uint32_t vectorBlockIdx = AscendC::GetBlockIdx();
         coreIdx = vectorBlockIdx / subBlockNum;
         subBlockIdx = vectorBlockIdx % subBlockNum;
+        // TODO-------------------
+        // AscendC::TPipe pipePre;
+        // EpilogueFAGPre epilogueFagPre(xxxx);
+        // epilogueFagPre();
+        // pipePre.Destroy();
+
+        // AscendC::TPipe pipeSoftmaxGrad;
+        // EpilogueFAGSfmg epilogueFagSfmg(xxxx);
+        // epilogueFagSfmg();
+        // pipeSoftmaxGrad.Destroy();
 #endif
+        AscendC::SyncAll<false>();
         RunTasks(coreIdx, subBlockIdx);
+        AscendC::SyncAll<false>();
+#ifdef __DAV_VEC__
+        // TODO-------------------
+        // AscendC::TPipe pipePost;
+        // EpilogueFAGPost epilogueFagPost(xxxx);
+        // epilogueFagPost();
+        // pipePost.Destroy();
+#endif
     }
 
 private:
@@ -314,15 +363,15 @@ private:
                 FAGBlockInfo block{};
                 if (!DecodeBlock(blockBegin + issueLane, block)) {
                     if (taskId != 0) {
-                        // no more task to complete, consume last block and finish
+                        // Drain the last task. There is no following task, so
+                        // its L1 buffers do not need to be returned.
 #ifdef __DAV_CUBE__
-                        WaitV1Ready(previousBlock_);
-                        ProcessC2Task(previousBlock_);
+                        ProcessC5Stage(previousBlock_, false);
+                        ProcessC34Stage(previousBlock_, false);
 #endif
 #ifdef __DAV_VEC__
-                        WaitC1Ready(previousBlock_, subBlockIdx);
-                        ProcessV1Task(previousBlock_, subBlockIdx);
-                        SetV1Ready(previousBlock_, subBlockIdx);
+                        ProcessV1Stage(previousBlock_, subBlockIdx);
+                        ProcessV2Stage(previousBlock_, subBlockIdx);
 #endif
                     }
                     return;
@@ -332,19 +381,19 @@ private:
                 block.issueLane = issueLane;
 
 #ifdef __DAV_CUBE__
-                // C1(i) overlaps V1/C2(i - 1).
-                ProcessC1Task(block);
-                SetC1Ready(block);
+                // Front-end MM of task i overlaps the vector and back-end MM
+                // stages of task i - 1.
+                ProcessC1Stage(block);
+                ProcessC2Stage(block);
                 if (taskId != 0) {
-                    WaitV1Ready(previousBlock_);
-                    ProcessC2Task(previousBlock_);
+                    ProcessC5Stage(previousBlock_, true);
+                    ProcessC34Stage(previousBlock_, true);
                 }
 #endif
 #ifdef __DAV_VEC__
                 if (taskId != 0) {
-                    WaitC1Ready(previousBlock_, subBlockIdx);
-                    ProcessV1Task(previousBlock_, subBlockIdx);
-                    SetV1Ready(previousBlock_, subBlockIdx);
+                    ProcessV1Stage(previousBlock_, subBlockIdx);
+                    ProcessV2Stage(previousBlock_, subBlockIdx);
                 }
 #endif
 
@@ -356,65 +405,128 @@ private:
 
 #ifdef __DAV_CUBE__
     CATLASS_DEVICE
-    void SetC1Ready(FAGBlockInfo const &block)
+    void ProcessC1Stage(FAGBlockInfo const &block)
     {
-        // TODO: AIC sets C1-ready flags for both AIV sub-blocks.
-        // block.taskId can select the ping-pong flag slot.
-        (void)block;
+        // C1 actual computation and its completion notification stay together.
+        // TODO: Run C1 = Q * K^T for this block.
+        const uint32_t flagSlot =
+            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint16_t flagId = SYNC_C1_TO_V1_FLAG[flagSlot];
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
+            flagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
-    void WaitV1Ready(FAGBlockInfo const &block)
+    void ProcessC2Stage(FAGBlockInfo const &block)
     {
-        // TODO: AIC waits for V1-ready from both AIV sub-blocks.
-        (void)block;
+        // C2 actual computation and its completion notification stay together.
+        // TODO: Run C2 = dY * V^T for this block.
+        const uint32_t flagSlot =
+            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint16_t flagId = SYNC_C2_TO_V2_FLAG[flagSlot];
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
+            flagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
-    void ProcessC1Task(FAGBlockInfo const &block)
+    void ProcessC34Stage(
+        FAGBlockInfo const &block,
+        bool returnL1)
     {
-        // TODO: Run C1 for this block.
-        (void)block;
+        // Wait until both vector sub-blocks have produced dS in L1.
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+            SYNC_V2_TO_C34_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+            SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
+
+        // TODO: Run C3 = dS * K for this block.
+        // TODO: Run C4 = dS^T * Q for this block.
+
+        // A following V2 stage needs an explicit ownership return before it
+        // can overwrite the single dS L1 buffer. The drained last task does not.
+        if (returnL1) {
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+                SYNC_C34_TO_V2_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+                SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
+        }
     }
 
     CATLASS_DEVICE
-    void ProcessC2Task(FAGBlockInfo const &block)
+    void ProcessC5Stage(
+        FAGBlockInfo const &block,
+        bool returnL1)
     {
-        // TODO: Run C2 for this block.
-        (void)block;
+        // Wait until both vector sub-blocks have produced P in L1.
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+            SYNC_V1_TO_C5_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+            SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
+
+        // TODO: Run C5 = P^T * dY for this block.
+
+        // A following V1 stage needs an explicit ownership return before it
+        // can overwrite the single P L1 buffer. The drained last task does not.
+        if (returnL1) {
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+                SYNC_C5_TO_V1_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+                SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
+        }
     }
 #endif
 
 #ifdef __DAV_VEC__
     CATLASS_DEVICE
-    void WaitC1Ready(
+    void ProcessV1Stage(
         FAGBlockInfo const &block,
         uint32_t subBlockIdx)
     {
-        // TODO: Each AIV waits for its C1-ready flag.
-        (void)block;
-        (void)subBlockIdx;
-    }
+        const uint32_t flagSlot =
+            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(
+            SYNC_C1_TO_V1_FLAG[flagSlot]);
 
-    CATLASS_DEVICE
-    void SetV1Ready(
-        FAGBlockInfo const &block,
-        uint32_t subBlockIdx)
-    {
-        // TODO: Each AIV publishes its V1-ready flag to AIC.
-        (void)block;
-        (void)subBlockIdx;
-    }
+        // Before task 1 and later overwrite P in L1, C5 must return ownership
+        // of the buffer used by the preceding task.
+        if (block.taskId != 0) {
+            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
+                SYNC_C5_TO_V1_FLAG);
+        }
 
-    CATLASS_DEVICE
-    void ProcessV1Task(
-        FAGBlockInfo const &block,
-        uint32_t subBlockIdx)
-    {
-        // TODO: Run V1 for this block.
+        // TODO: Run V1 = scaled-mask-softmax for this block.
         // Both AIV sub-blocks process the same block and split vector work.
-        (void)block;
-        (void)subBlockIdx;
+
+        // Notify C5 only after this vector sub-block has finished writing P.
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
+            SYNC_V1_TO_C5_FLAG);
+    }
+
+    CATLASS_DEVICE
+    void ProcessV2Stage(
+        FAGBlockInfo const &block,
+        uint32_t subBlockIdx)
+    {
+        const uint32_t flagSlot =
+            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(
+            SYNC_C2_TO_V2_FLAG[flagSlot]);
+
+        // Before task 1 and later overwrite dS in L1, C3/C4 must return
+        // ownership of the buffer used by the preceding task.
+        if (block.taskId != 0) {
+            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
+                SYNC_C34_TO_V2_FLAG);
+        }
+
+        // TODO: Run V2 = dS computation for this block. V2 consumes P from
+        // V1 and dP from C2, then writes dS to L1 for C3/C4.
+
+        // Notify C3/C4 only after this vector sub-block has finished writing dS.
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
+            SYNC_V2_TO_C34_FLAG);
     }
 #endif
 
