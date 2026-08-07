@@ -52,7 +52,8 @@ template <
     class EpilogueSubMul_,
     FAGTiling950::Layout INPUT_LAYOUT,
     bool IS_ATTEN_MASK,
-    bool IS_DTM
+    bool IS_DTM,
+    bool IS_SOFTCAP
 >
 class FlashAttentionScoreGrad950 {
 public:
@@ -109,6 +110,7 @@ public:
         waveSize_ =
             static_cast<uint64_t>(coreNum_) * continuousBlockNum_;
         scaleValue_ = tiling_->scaleValue;
+        softcapValue_ = tiling_->softcapValue;
 
         // L1 layout:
         //   [P ping][P pong][dS ping][dS pong]
@@ -636,6 +638,7 @@ private:
             mte2ToVEvent,
             vToMte3Event,
             scaleValue_,
+            softcapValue_,
             subBlockRealS1,
             subBlockIdx);
 
@@ -727,6 +730,7 @@ private:
     uint32_t continuousBlockNum_ = 0;
     uint64_t waveSize_ = 0;
     float scaleValue_ = 1.0f;
+    float softcapValue_ = 0.0f;
 
     uint32_t decoderBatchIdx_ = 0;
     uint64_t decoderBatchBlockBegin_ = 0;
@@ -750,7 +754,8 @@ template <
     typename DataType,
     FAGTiling950::Layout INPUT_LAYOUT,
     bool IS_CAUSAL,
-    bool IS_DETERMINISTIC>
+    bool IS_DETERMINISTIC,
+    bool IS_SOFTCAP>
 CATLASS_GLOBAL void FlashAttentionV3Bwd950(
     GM_ADDR dout,
     GM_ADDR q,
@@ -771,7 +776,7 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
 
     using DispatchPolicyScaledMaskSoftmax =
         Catlass::Epilogue::EpilogueAscend950FAGScaledMaskSoftmax<
-            INPUT_LAYOUT, IS_CAUSAL>;
+            INPUT_LAYOUT, IS_CAUSAL, IS_SOFTCAP>;
     using EpilogueScaledMaskSoftmax =
         Catlass::Epilogue::Block::BlockEpilogue<
             DispatchPolicyScaledMaskSoftmax,
@@ -794,7 +799,8 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
         EpilogueSubMul,
         INPUT_LAYOUT,
         IS_CAUSAL,
-        IS_DETERMINISTIC>;
+        IS_DETERMINISTIC,
+        IS_SOFTCAP>;
     FAGKernelParams params{dout, q, k, v, out, mask, softmax_lse,
         cu_seqlens_q, cu_seqlens_k, dq, dk, dv, workspace, tiling};
     FAGKernel950 fag;

@@ -15,12 +15,13 @@ namespace Catlass::Epilogue {
 
 // V1 epilogue policy. The policy carries compile-time layout and mask choices
 // from the kernel entrypoint to the matching BlockEpilogue specialization.
-template <FAGTiling950::Layout INPUT_LAYOUT_, bool IS_ATTEN_MASK_>
+template <FAGTiling950::Layout INPUT_LAYOUT_, bool IS_ATTEN_MASK_, bool IS_SOFTCAP_>
 struct EpilogueAscend950FAGScaledMaskSoftmax {
     using ArchTag = Arch::Ascend950;
 
     static constexpr FAGTiling950::Layout INPUT_LAYOUT = INPUT_LAYOUT_;
     static constexpr bool IS_ATTEN_MASK = IS_ATTEN_MASK_;
+    static constexpr bool IS_SOFTCAP = IS_SOFTCAP_;
 };
 
 // V2 epilogue policy. Layout remains a compile-time property so the future

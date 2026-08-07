@@ -54,6 +54,7 @@ struct FAGInfo {
     uint32_t continuousBlockNum = DEFAULT_CONTINUOUS_BLOCK_NUM;
     uint64_t ubSize = 0;
     float scaleValue = 1.0f;
+    float softcapValue = 0.0f;
 };
 
 struct FAGTilingData {
@@ -78,7 +79,7 @@ struct FAGTilingData {
     uint64_t qkHeadDim = 0;
     uint64_t vHeadDim = 0;
     float scaleValue = 1.0f;
-    uint32_t reserved1 = 0;
+    float softcapValue = 0.0f;
 
     uint32_t qTile = 0;
     uint32_t kvTile = 0;

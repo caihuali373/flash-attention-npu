@@ -18,19 +18,20 @@ namespace Catlass::Epilogue::Block {
 template <
     FAGTiling950::Layout INPUT_LAYOUT_,
     bool IS_ATTEN_MASK_,
+    bool IS_SOFTCAP_,
     class ElementP_,
     class ElementS_,
     class TilingData_>
 class BlockEpilogue<
     EpilogueAscend950FAGScaledMaskSoftmax<
-        INPUT_LAYOUT_, IS_ATTEN_MASK_>,
+        INPUT_LAYOUT_, IS_ATTEN_MASK_, IS_SOFTCAP_>,
     ElementP_,
     ElementS_,
     TilingData_> {
 public:
     using DispatchPolicy =
         EpilogueAscend950FAGScaledMaskSoftmax<
-            INPUT_LAYOUT_, IS_ATTEN_MASK_>;
+            INPUT_LAYOUT_, IS_ATTEN_MASK_, IS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementP = ElementP_;
     using ElementS = ElementS_;
@@ -38,6 +39,7 @@ public:
 
     static constexpr FAGTiling950::Layout INPUT_LAYOUT = INPUT_LAYOUT_;
     static constexpr bool IS_ATTEN_MASK = IS_ATTEN_MASK_;
+    static constexpr bool IS_SOFTCAP = IS_SOFTCAP_;
 
     CATLASS_DEVICE
     BlockEpilogue() = default;
@@ -71,6 +73,7 @@ public:
         event_t mte2ToVEvent,
         event_t vToMte3Event,
         float scaleValue,
+        float softcapValue,
         uint64_t s1RealSize,
         uint32_t subBlockIdx)
     {
@@ -138,15 +141,16 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
 
-        // 3. Muls(scale) + mask + simpleSoftmax + Cast + Nd2Nz
-        MulsMaskSimpleSoftmax<IS_ATTEN_MASK>(
+        // 3. scale + optional softcap + mask + exp(S-LSE) + Cast + Nd2Nz
+        MulsMaskSimpleSoftmax<IS_ATTEN_MASK, IS_SOFTCAP>(
             reinterpret_cast<__ubuf__ ElementP *>(ubPTensor.GetPhyAddr()),
             reinterpret_cast<__ubuf__ ElementS *>(ubMm1Tensor.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint8_t *>(attenMaskUbTensor.GetPhyAddr()),
             reinterpret_cast<__ubuf__ float *>(lseUbTensor.GetPhyAddr()),
             static_cast<uint16_t>(s1RealSize),
             block.s2Extend,
-            scaleValue);
+            scaleValue,
+            softcapValue);
 
         // 4. UB --> L1
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
@@ -166,13 +170,16 @@ private:
     /**
      * Rebuild P from the QK result and the LSE saved by forward:
      *
-     *   P = exp(scale * S - LSE)
+     *   logits = scaleValue * S
+     *   logits = softcap * tanh(logits)  (when enabled; host has already
+     *                                    set scaleValue = scale / softcap)
+     *   P = exp(logits - LSE)
      *
      * A non-zero byte in maskUb denotes a masked element. S, mask, and P all
      * use a fixed 128-element physical row stride; n is only the number of
      * valid columns in the current basic block.
      */
-    template <bool HAS_ATTEN_MASK>
+    template <bool HAS_ATTEN_MASK, bool HAS_SOFTCAP>
     __simd_vf__ inline void MulsMaskSimpleSoftmax(
         __ubuf__ ElementP *dstUb,
         __ubuf__ ElementS *srcUb,
@@ -180,7 +187,8 @@ private:
         __ubuf__ float *lseUb,
         uint16_t m,
         uint32_t n,
-        float scaleValue)
+        float scaleValue,
+        float softcapValue)
     {
         using namespace AscendC::MicroAPI;
 
@@ -203,6 +211,7 @@ private:
         RegTensor<float> srcOddVreg;
         RegTensor<float> lseVreg;
         RegTensor<float> minVreg;
+        RegTensor<float> softcapNumeratorVreg;
         RegTensor<ElementP> dstVreg0;
         RegTensor<ElementP> dstVreg1;
         RegTensor<ElementP> dstVreg;
@@ -226,6 +235,26 @@ private:
 
             Muls(srcVreg0, srcVreg0, scaleValue, pregTail0);
             Muls(srcVreg1, srcVreg1, scaleValue, pregTail1);
+
+            if constexpr (HAS_SOFTCAP) {
+                // softcap * tanh(x), matching the forward logits. The lower
+                // clamp bounds exp(-2*x) without affecting
+                // the representable tanh result.
+                Duplicate(softcapNumeratorVreg, 2.0f * softcapValue);
+                Maxs(srcVreg0, srcVreg0, -8.8f, pregTail0);
+                Muls(srcVreg0, srcVreg0, -2.0f, pregTail0);
+                Exp(srcVreg0, srcVreg0, pregTail0);
+                Adds(srcVreg0, srcVreg0, 1.0f, pregTail0);
+                Div(srcVreg0, softcapNumeratorVreg, srcVreg0, pregTail0);
+                Adds(srcVreg0, srcVreg0, -softcapValue, pregTail0);
+
+                Maxs(srcVreg1, srcVreg1, -8.8f, pregTail1);
+                Muls(srcVreg1, srcVreg1, -2.0f, pregTail1);
+                Exp(srcVreg1, srcVreg1, pregTail1);
+                Adds(srcVreg1, srcVreg1, 1.0f, pregTail1);
+                Div(srcVreg1, softcapNumeratorVreg, srcVreg1, pregTail1);
+                Adds(srcVreg1, srcVreg1, -softcapValue, pregTail1);
+            }
 
             if constexpr (HAS_ATTEN_MASK) {
                 __ubuf__ uint8_t *maskRow = maskUb + i * S2_ROW_STRIDE;

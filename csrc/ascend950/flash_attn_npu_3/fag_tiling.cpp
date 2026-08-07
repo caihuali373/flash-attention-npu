@@ -45,6 +45,7 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
     tiling.qkHeadDim = info.qkHeadDim;
     tiling.vHeadDim = info.vHeadDim;
     tiling.scaleValue = info.scaleValue;
+    tiling.softcapValue = info.softcapValue;
 
     tiling.qTile = 128;
     tiling.kvTile = 128;

@@ -61,8 +61,9 @@ mha_bwd(
                 "Ascend950 v3 bwd does not support seqused_q/seqused_k now");
     TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
                 "Ascend950 v3 bwd does not support sliding-window attention now");
-    TORCH_CHECK(softcap == 0.0,
-                "Ascend950 v3 bwd does not support softcap now");
+    TORCH_CHECK(std::isfinite(softcap) && softcap >= 0.0 &&
+                    softcap <= std::numeric_limits<float>::max(),
+                "Ascend950 v3 bwd: softcap must be finite and non-negative");
     TORCH_CHECK(sm_margin == 0,
                 "Ascend950 v3 bwd does not support sm_margin");
     TORCH_CHECK(q.dtype() == at::kHalf || q.dtype() == at::kBFloat16,
@@ -114,6 +115,13 @@ mha_bwd(
     FAGTiling950::FAGInfo fag_info{};
     fag_info.scaleValue = static_cast<float>(
         softmax_scale_.value_or(1.0 / std::sqrt(static_cast<double>(qk_head_dim))));
+    const bool has_softcap = softcap > 0.0;
+    if (has_softcap) {
+        // Match Ascend910 FAG: the device scale is already normalized by
+        // softcap, so the epilogue only evaluates softcap * tanh(S * scale).
+        fag_info.scaleValue /= static_cast<float>(softcap);
+    }
+    fag_info.softcapValue = static_cast<float>(softcap);
     fag_info.layout = is_varlen ? FAGTiling950::Layout::TND
                                 : FAGTiling950::Layout::BSND;
     fag_info.maskType = is_causal ? FAGTiling950::MaskType::CAUSAL
@@ -244,10 +252,10 @@ mha_bwd(
         mask = ptr(mask_npu_tensor);
     }
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC)          \
+#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP) \
     FlashAttentionV3Bwd950<                                                     \
         DTYPE, FAGTiling950::Layout::INPUT_LAYOUT,                              \
-        IS_CAUSAL, IS_DETERMINISTIC><<<aic_num, nullptr, stream>>>(             \
+        IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP><<<aic_num, nullptr, stream>>>( \
             ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask,                  \
             ptr(softmax_lse), cu_q, cu_k, ptr(dq), ptr(dk), ptr(dv),            \
             ptr(workspace), ptr(tiling_device))
@@ -256,15 +264,31 @@ mha_bwd(
     do {                                                                         \
         if (is_causal) {                                                         \
             if (deterministic) {                                                 \
-                LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true);                  \
+                if (has_softcap) {                                               \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true);         \
+                } else {                                                         \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, false);        \
+                }                                                                \
             } else {                                                             \
-                LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false);                 \
+                if (has_softcap) {                                               \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, true);        \
+                } else {                                                         \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, false);       \
+                }                                                                \
             }                                                                    \
         } else {                                                                 \
             if (deterministic) {                                                 \
-                LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true);                 \
+                if (has_softcap) {                                               \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, true);        \
+                } else {                                                         \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, false);       \
+                }                                                                \
             } else {                                                             \
-                LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false);                \
+                if (has_softcap) {                                               \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, true);       \
+                } else {                                                         \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, false);      \
+                }                                                                \
             }                                                                    \
         }                                                                        \
     } while (0)
