@@ -6,11 +6,14 @@
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
+#include "catlass/epilogue/block/block_epilogue.hpp"
 
 #include "tla/tensor.hpp"
 #include "tla/layout.hpp"
 
 #include "fag_common.h"
+#include "fag_epilogue_scaled_mask_softmax.hpp"
+#include "fag_epilogue_sub_mul.hpp"
 #include "kernel_operator.h"
 
 static constexpr uint32_t TASK_PINGPONG = 2;
@@ -45,12 +48,18 @@ static constexpr uint16_t SYNC_C5_TO_V1_FLAG = 9;
 
 template <
     typename DataType,
+    class EpilogueScaledMaskSoftmax_,
+    class EpilogueSubMul_,
     FAGTiling950::Layout INPUT_LAYOUT,
     bool IS_ATTEN_MASK,
     bool IS_DTM
 >
 class FlashAttentionScoreGrad950 {
 public:
+    using EpilogueScaledMaskSoftmax =
+        EpilogueScaledMaskSoftmax_;
+    using EpilogueSubMul = EpilogueSubMul_;
+
     // Methods
     CATLASS_DEVICE
     FlashAttentionScoreGrad950() {}
@@ -117,27 +126,50 @@ public:
                     l1dSBaseOffset + i * l1TileBytes);
         }
 
-        // Per-AIV UB layout:
-        //   [mm1 ping][mm1 pong][mm2 ping][mm2 pong]
+        // Per-AIV UB layout.  Ping and pong each own one complete half of UB:
+        //   ping: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)]
+        //   pong: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)]
         // Fixpipe SPLIT_M sends half of the logical M rows to each AIV.
         const uint32_t mAligned = RoundUp(qBlockSize_, 16);
+        const uint32_t rowsPerSubBlock = mAligned / 2;
         const uint32_t mmResTileBytes =
-            (mAligned / 2) * kvBlockSize_ * sizeof(float);
-        const uint32_t ubMm1BaseOffset = 0;
-        const uint32_t ubMm2BaseOffset =
-            TASK_PINGPONG * mmResTileBytes;
+            rowsPerSubBlock * kvBlockSize_ * sizeof(float);
+        const uint32_t attenMaskTileBytes =
+            rowsPerSubBlock * kvBlockSize_ * sizeof(uint8_t);
+        const uint32_t lseTileBytes = RoundUp(rowsPerSubBlock, 8) * sizeof(float);
+        const uint32_t pTileBytes =
+            (rowsPerSubBlock + 1) * kvBlockSize_ * sizeof(DataType);
+
+        const uint32_t mm1SlotOffset = 0;
+        const uint32_t mm2SlotOffset = mm1SlotOffset + mmResTileBytes;
+        const uint32_t attenMaskSlotOffset = mm2SlotOffset + mmResTileBytes;
+        const uint32_t lseSlotOffset = RoundUp(attenMaskSlotOffset + attenMaskTileBytes, 32);
+        const uint32_t pSlotOffset = RoundUp(lseSlotOffset + lseTileBytes, 32);
+        const uint32_t pingPongHalfBytes = RoundUp(pSlotOffset + pTileBytes, 32);
+
         for (uint32_t i = 0; i < TASK_PINGPONG; ++i) {
+            const uint32_t halfBaseOffset = i * pingPongHalfBytes;
             ubMm1ResTensor[i] =
                 resource.ubBuf.template GetBufferByByte<float>(
-                    ubMm1BaseOffset + i * mmResTileBytes);
+                    halfBaseOffset + mm1SlotOffset);
             ubMm2ResTensor[i] =
                 resource.ubBuf.template GetBufferByByte<float>(
-                    ubMm2BaseOffset + i * mmResTileBytes);
+                    halfBaseOffset + mm2SlotOffset);
+            attenMaskUbTensor[i] =
+                resource.ubBuf.template GetBufferByByte<uint8_t>(
+                    halfBaseOffset + attenMaskSlotOffset);
+            lseUbTensor[i] =
+                resource.ubBuf.template GetBufferByByte<float>(
+                    halfBaseOffset + lseSlotOffset);
+            ubPTensor[i] =
+                resource.ubBuf.template GetBufferByByte<DataType>(
+                    halfBaseOffset + pSlotOffset);
         }
 
         if (batchNum_ != 0 && qBlockSize_ != 0 && kvBlockSize_ != 0) {
             LoadDecoderBatch();
         }
+        InitEvents();
     }
 
     CATLASS_DEVICE
@@ -154,6 +186,13 @@ public:
         const uint32_t vectorBlockIdx = AscendC::GetBlockIdx();
         coreIdx = vectorBlockIdx / subBlockNum;
         subBlockIdx = vectorBlockIdx % subBlockNum;
+        epilogueScaledMaskSoftmax_.Init(
+            resource,
+            params.tiling);
+        epilogueSubMul_.Init(
+            resource,
+            params.workspace,
+            params.tiling);
         // TODO-------------------
         // AscendC::TPipe pipePre;
         // EpilogueFAGPre epilogueFagPre(xxxx);
@@ -179,6 +218,15 @@ public:
 
 private:
     using TilingData = FAGTiling950::FAGTilingData;
+
+    CATLASS_DEVICE
+    void InitEvents()
+    {
+        vWaitMte2Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
+        vWaitMte2Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
+        vWaitMte3Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        vWaitMte3Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+    }
 
     CATLASS_DEVICE
     void GetBatchShape(
@@ -301,6 +349,8 @@ private:
         block.s2BlockIdx = decoderS2BlockIdx_;
         block.s1Start = s1Start;
         block.s2Start = s2Start;
+        block.curBatchS1 = decoderS1Length_;
+        block.curBatchS2 = decoderS2Length_;
         block.s1Extend =
             Min(qBlockSize_, decoderS1Length_ - s1Start);
         block.s2Extend =
@@ -315,6 +365,8 @@ private:
             (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
         block.doutOffset =
             (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
+        // TODO: M方向划分和MM1输出一致
+        block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
     }
 
     CATLASS_DEVICE
@@ -535,8 +587,57 @@ private:
                 SYNC_C5_TO_V1_FLAG);
         }
 
-        // TODO: Run V1 = scaled-mask-softmax for this block.
-        // Both AIV sub-blocks process the same block and split vector work.
+        auto attenMaskLayout = tla::MakeLayout<
+            uint8_t, Catlass::layout::RowMajor>(256, 256);
+        auto attenMaskGmTensor = tla::MakeTensor(
+            attenMaskGm_, attenMaskLayout, Catlass::Arch::PositionGM{});
+
+        uint64_t lseRows = 0;
+        uint64_t lseColumns = 0;
+        uint64_t lseRowOffset = 0;
+        uint64_t lseColOffset = 0;
+        const uint64_t n1Idx = static_cast<uint64_t>(block.n2Idx) * groupNum_ + block.groupIdx;
+        const uint64_t subBlockS1Offset = subBlockIdx * block.firstHalfRealS1;
+        const uint64_t subBlockRealS1 = subBlockIdx ?
+            block.s1Extend - block.firstHalfRealS1 :
+            block.firstHalfRealS1;
+        if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+            // TND:  [N1, totalS1]
+            lseRows = qHeadNum_;
+            lseColumns = tiling_->totalQ;
+            lseRowOffset = n1Idx;
+            lseColOffset = block.totalS1Start + subBlockS1Offset;
+        } else {
+            // BSND: [B * N1, S1]
+            lseRows = static_cast<uint64_t>(batchNum_) * qHeadNum_;
+            lseColumns = qSeqlen_;
+            lseRowOffset = static_cast<uint64_t>(block.batchIdx) * qHeadNum_ + n1Idx;
+            lseColOffset = block.s1Start + subBlockS1Offset;
+        }
+        auto softmaxLseLayout = tla::MakeLayout<
+            float, Catlass::layout::RowMajor>(lseRows, lseColumns);
+        auto softmaxLseGmTensor = tla::MakeTensor(
+            softmaxLseGm_, softmaxLseLayout,
+            tla::MakeCoord(lseRowOffset, lseColOffset),
+            Catlass::Arch::PositionGM{});
+
+        event_t mte2ToVEvent = flagSlot ? vWaitMte2Pong : vWaitMte2Ping;
+        event_t vToMte3Event = flagSlot ? vWaitMte3Pong : vWaitMte3Ping;
+
+        epilogueScaledMaskSoftmax_(
+            block,
+            attenMaskGmTensor,
+            softmaxLseGmTensor,
+            attenMaskUbTensor[flagSlot],
+            lseUbTensor[flagSlot],
+            ubMm1ResTensor[flagSlot],
+            ubPTensor[flagSlot],
+            l1PTensor[flagSlot],
+            mte2ToVEvent,
+            vToMte3Event,
+            scaleValue_,
+            subBlockRealS1,
+            subBlockIdx);
 
         // Notify C5 only after this vector sub-block has finished writing P.
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
@@ -559,9 +660,13 @@ private:
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
                 SYNC_C34_TO_V2_FLAG);
         }
-
-        // TODO: Run V2 = dS computation for this block. V2 consumes P from
-        // V1 and dP from C2, then writes dS to L1 for C3/C4.
+        const uint32_t bufferId = flagSlot;
+        epilogueSubMul_(
+            block,
+            ubMm2ResTensor[bufferId],
+            l1PTensor[bufferId],
+            l1dSTensor[bufferId],
+            subBlockIdx);
 
         // Notify C3/C4 only after this vector sub-block has finished writing dS.
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
@@ -571,6 +676,10 @@ private:
 
 private:
     Catlass::Arch::Resource<Catlass::Arch::Ascend950> resource;
+#ifdef __DAV_VEC__
+    EpilogueScaledMaskSoftmax epilogueScaledMaskSoftmax_;
+    EpilogueSubMul epilogueSubMul_;
+#endif
 
     const __gm__ TilingData *tiling_ = nullptr;
 
@@ -595,6 +704,14 @@ private:
     AscendC::LocalTensor<DataType> l1dSTensor[TASK_PINGPONG];
     AscendC::LocalTensor<float> ubMm1ResTensor[TASK_PINGPONG];
     AscendC::LocalTensor<float> ubMm2ResTensor[TASK_PINGPONG];
+    AscendC::LocalTensor<uint8_t> attenMaskUbTensor[TASK_PINGPONG];
+    AscendC::LocalTensor<float> lseUbTensor[TASK_PINGPONG];
+    AscendC::LocalTensor<DataType> ubPTensor[TASK_PINGPONG];
+
+    event_t vWaitMte2Ping;
+    event_t vWaitMte2Pong;
+    event_t vWaitMte3Ping;
+    event_t vWaitMte3Pong;
 
     uint32_t batchNum_ = 0;
     uint32_t qSeqlen_ = 0;
@@ -652,8 +769,32 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
 {
     // TODO: 各个block待补充
 
+    using DispatchPolicyScaledMaskSoftmax =
+        Catlass::Epilogue::EpilogueAscend950FAGScaledMaskSoftmax<
+            INPUT_LAYOUT, IS_CAUSAL>;
+    using EpilogueScaledMaskSoftmax =
+        Catlass::Epilogue::Block::BlockEpilogue<
+            DispatchPolicyScaledMaskSoftmax,
+            DataType,
+            float,
+            FAGTiling950::FAGTilingData>;
+    using DispatchPolicySubMul =
+        Catlass::Epilogue::EpilogueAscend950FAGSubMul<INPUT_LAYOUT>;
+    using EpilogueSubMul =
+        Catlass::Epilogue::Block::BlockEpilogue<
+            DispatchPolicySubMul,
+            DataType,
+            DataType,
+            float,
+            FAGTiling950::FAGTilingData>;
+
     using FAGKernel950 = FlashAttentionScoreGrad950<
-        DataType, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC>;
+        DataType,
+        EpilogueScaledMaskSoftmax,
+        EpilogueSubMul,
+        INPUT_LAYOUT,
+        IS_CAUSAL,
+        IS_DETERMINISTIC>;
     FAGKernelParams params{dout, q, k, v, out, mask, softmax_lse,
         cu_seqlens_q, cu_seqlens_k, dq, dk, dv, workspace, tiling};
     FAGKernel950 fag;

@@ -113,8 +113,11 @@ struct FAGBlockInfo {
 
     uint32_t s1Start = 0;
     uint32_t s2Start = 0;
+    uint32_t curBatchS1 = 0;
+    uint32_t curBatchS2 = 0;
     uint32_t s1Extend = 0;
     uint32_t s2Extend = 0;
+    uint32_t firstHalfRealS1 = 0;
 
     uint64_t totalS1Start = 0;
     uint64_t totalS2Start = 0;
