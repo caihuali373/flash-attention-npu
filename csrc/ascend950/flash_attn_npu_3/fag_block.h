@@ -33,6 +33,20 @@ struct EpilogueAscend950FAGSubMul {
     static constexpr FAGTiling950::Layout INPUT_LAYOUT = INPUT_LAYOUT_;
 };
 
+// Ascend950 / Arch3501 FAG dQKV
+// Computes dq=dS*K, dk=dS^T*Q, dv=P^T*dY in one block.
+template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2, bool ENABLE_UNIT_FLAG_ = true>
+struct MmadAscend950FagdQKV {
+    using ArchTag = Arch::Ascend950;
+    static constexpr uint32_t L1A_STAGES = L1A_STAGES_;
+    static constexpr uint32_t L1B_STAGES = L1B_STAGES_;
+    static constexpr uint32_t L0AB_STAGES = 2;
+    static constexpr uint32_t L0C_STAGES = 4;
+    static constexpr uint32_t L0C_BUF_SIZE = 64 * 1024;
+    static constexpr uint32_t BASE = 128;
+    static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
+};
+
 }  // namespace Catlass::Epilogue
 
 #endif  // FLASH_ATTN_NPU_ASCEND950_V3_FAG_BLOCK_H
