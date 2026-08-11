@@ -35,4 +35,48 @@ struct EpilogueAscend950FAGSubMul {
 
 }  // namespace Catlass::Epilogue
 
+namespace Catlass::Gemm {
+struct Ascend950FagL0CLayout {
+    static constexpr uint32_t L0C_BUF_SIZE = 64 * 1024;
+    static constexpr uint32_t L0C_SLOT_NUM = 4;
+    static constexpr uint32_t SLOT_SDP_0 = 0;
+    static constexpr uint32_t SLOT_SDP_1 = 1;
+    static constexpr uint32_t SLOT_DK = 2;
+    static constexpr uint32_t SLOT_DV = 3;
+    static constexpr uint32_t SLOT_DQ = SLOT_SDP_0;
+    static constexpr uint32_t SLOT_DQ_PING = SLOT_SDP_1;
+    static constexpr uint32_t L0C_SDP_SLOT_NUM = 2;
+};
+
+
+// Ascend950 / Arch3501 FAG dQKV
+// Computes dq=dS*K, dk=dS^T*Q, dv=P^T*dY in one block.
+template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2, bool ENABLE_UNIT_FLAG_ = true>
+struct MmadAscend950FagdQKV {
+    using ArchTag = Arch::Ascend950;
+    static constexpr uint32_t L1A_STAGES = L1A_STAGES_;
+    static constexpr uint32_t L1B_STAGES = L1B_STAGES_;
+    static constexpr uint32_t L0AB_STAGES = 2;
+    static constexpr uint32_t L0C_STAGES = Ascend950FagL0CLayout::L0C_SLOT_NUM;
+    static constexpr uint32_t L0C_BUF_SIZE = Ascend950FagL0CLayout::L0C_BUF_SIZE;
+    static constexpr uint32_t BASE = 128;
+    static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
+};
+
+// Ascend950 FAG S / dP: S = Q * K^T, dP = dY * V^T.
+template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2, bool ENABLE_UNIT_FLAG_ = true>
+struct MmadAscend950FagSdP {
+    using ArchTag = Arch::Ascend950;
+    static constexpr uint32_t L1A_STAGES = L1A_STAGES_;
+    static constexpr uint32_t L1B_STAGES = L1B_STAGES_;
+    static constexpr uint32_t L0AB_STAGES = 2;
+    static constexpr uint32_t L0C_STAGES = Ascend950FagL0CLayout::L0C_SDP_SLOT_NUM;
+    static constexpr uint32_t L0C_BUF_SIZE = Ascend950FagL0CLayout::L0C_BUF_SIZE;
+    static constexpr uint32_t BASE = 128;
+    static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
+};
+
+}
+// namespace Catlass::Gemm
+
 #endif  // FLASH_ATTN_NPU_ASCEND950_V3_FAG_BLOCK_H
