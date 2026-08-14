@@ -138,7 +138,8 @@ public:
             rowsPerSubBlock * kvBlockSize_ * sizeof(float);
         const uint32_t attenMaskTileBytes =
             rowsPerSubBlock * kvBlockSize_ * sizeof(uint8_t);
-        const uint32_t lseTileBytes = RoundUp(rowsPerSubBlock, 8) * sizeof(float);
+        const uint32_t lseTileBytes =
+            RoundUp(rowsPerSubBlock, 8) * 8U * sizeof(float);
         const uint32_t pTileBytes =
             (rowsPerSubBlock + 1) * kvBlockSize_ * sizeof(DataType);
 
@@ -664,11 +665,16 @@ private:
                 SYNC_C34_TO_V2_FLAG);
         }
         const uint32_t bufferId = flagSlot;
+        event_t mte2ToVEvent = flagSlot ? vWaitMte2Pong : vWaitMte2Ping;
+        event_t vToMte3Event = flagSlot ? vWaitMte3Pong : vWaitMte3Ping;
         epilogueSubMul_(
             block,
             ubMm2ResTensor[bufferId],
-            l1PTensor[bufferId],
+            ubPTensor[bufferId],
+            lseUbTensor[bufferId], // delta reuse lseUB
             l1dSTensor[bufferId],
+            mte2ToVEvent,
+            vToMte3Event,
             subBlockIdx);
 
         // Notify C3/C4 only after this vector sub-block has finished writing dS.
