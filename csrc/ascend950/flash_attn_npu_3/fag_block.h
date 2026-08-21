@@ -26,11 +26,12 @@ struct EpilogueAscend950FAGScaledMaskSoftmax {
 
 // V2 epilogue policy. Layout remains a compile-time property so the future
 // implementation can specialize delta addressing for BSND and TND.
-template <FAGTiling950::Layout INPUT_LAYOUT_>
+template <FAGTiling950::Layout INPUT_LAYOUT_, bool IS_SOFTCAP_>
 struct EpilogueAscend950FAGSubMul {
     using ArchTag = Arch::Ascend950;
 
     static constexpr FAGTiling950::Layout INPUT_LAYOUT = INPUT_LAYOUT_;
+    static constexpr bool IS_SOFTCAP = IS_SOFTCAP_;
 };
 
 }  // namespace Catlass::Epilogue

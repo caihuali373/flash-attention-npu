@@ -136,42 +136,6 @@ public:
     CATLASS_DEVICE
     ~BlockMmadTla() {}
 
-    CATLASS_DEVICE
-    void SetFlag()
-    {
-        for (uint32_t i = 0; i < L0AB_STAGES; i++) {
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[i]);
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[i]);
-        }
-        if constexpr (!ENABLE_UNIT_FLAG) {
-            for (uint32_t i = 0; i < L0C_STAGES; i++) {
-                AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[i]);
-            }
-        }
-        for (uint32_t i = 0; i < 4; i++) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[i]);
-        }
-        l0AListId = 0;
-        l0BListId = 0;
-    }
-
-    CATLASS_DEVICE
-    void WaitFlag()
-    {
-        for (uint32_t i = 0; i < L0AB_STAGES; i++) {
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[i]);
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[i]);
-        }
-        if constexpr (!ENABLE_UNIT_FLAG) {
-            for (uint32_t i = 0; i < L0C_STAGES; i++) {
-                AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[i]);
-            }
-        }
-        for (uint32_t i = 0; i < 4; i++) {
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[i]);
-        }
-    }
-
     /**
      * Calc: C = A * B^T, Fixpipe L0C -> UB.
      * actualShape = (sqActual, skvActual, dActual).
@@ -182,8 +146,6 @@ public:
     CATLASS_DEVICE
     void operator()(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape)
     {
-        SetFlag();
-
         uint32_t sqActual = actualShape.m();
         uint32_t skvActual = actualShape.n();
         uint32_t dActual = actualShape.k();
@@ -199,8 +161,6 @@ public:
             sqRound, skvRound, dRound, sqActual, skvActual, dActual, slotC, 0, 1);
         FixpipeUb(tensorC, l0CTensorList[slotC], sqActual, skvActual, sqRound, slotC);
         l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
-
-        WaitFlag();
     }
 
 protected:
@@ -229,8 +189,14 @@ protected:
         AscendC::LocalTensor<ElementB> l1Buf, TensorGm& gm,
         uint32_t dActual, uint32_t skvActual, uint32_t dRound, uint32_t skvRound, uint32_t eventIdx)
     {
+        auto layoutCol = tla::MakeLayout(
+            tla::MakeShape(dActual, skvActual),
+            tla::MakeStride(
+                tla::Int<1>{},
+                static_cast<int64_t>(tla::get<0>(gm.stride()))),
+            tla::MakeShape(dActual, skvActual));
         auto gmCol = tla::MakeTensor(
-            gm.data(), tla::MakeLayout<ElementB, layout::ColumnMajor>(dActual, skvActual), Arch::PositionGM{});
+            gm.data(), layoutCol, Arch::PositionGM{});
 
         using CopyGmToL1BOp = typename TileCopy::template CopyGmToL1B<decltype(gmCol)>;
         CopyGmToL1BOp copyGmToL1B;
