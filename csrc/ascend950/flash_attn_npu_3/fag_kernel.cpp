@@ -7,11 +7,15 @@
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/block/block_epilogue.hpp"
+#include "catlass/gemm/block/block_mmad.hpp"
 
 #include "tla/tensor.hpp"
 #include "tla/layout.hpp"
 
 #include "fag_common.h"
+#include "fag_block.h"
+#include "fag_mmad_sdp.hpp"
+#include "fag_mmad_dqkv.hpp"
 #include "fag_epilogue_scaled_mask_softmax.hpp"
 #include "fag_epilogue_sub_mul.hpp"
 #include "kernel_operator.h"
@@ -48,6 +52,8 @@ static constexpr uint16_t SYNC_C5_TO_V1_FLAG = 9;
 
 template <
     typename DataType,
+    class BlockMmadSdP_,
+    class BlockMmaddQKV_,
     class EpilogueScaledMaskSoftmax_,
     class EpilogueSubMul_,
     FAGTiling950::Layout INPUT_LAYOUT,
@@ -57,6 +63,8 @@ template <
 >
 class FlashAttentionScoreGrad950 {
 public:
+    using BlockMmadSdP = BlockMmadSdP_;
+    using BlockMmaddQKV = BlockMmaddQKV_;
     using EpilogueScaledMaskSoftmax =
         EpilogueScaledMaskSoftmax_;
     using EpilogueSubMul = EpilogueSubMul_;
@@ -77,14 +85,10 @@ public:
         qGm_.SetGlobalBuffer((__gm__ DataType *)params.q);
         kGm_.SetGlobalBuffer((__gm__ DataType *)params.k);
         vGm_.SetGlobalBuffer((__gm__ DataType *)params.v);
-        outGm_.SetGlobalBuffer((__gm__ DataType *)params.out);
         attenMaskGm_.SetGlobalBuffer((__gm__ uint8_t *)params.attenMask);
         softmaxLseGm_.SetGlobalBuffer((__gm__ float *)params.softmaxLse);
         cuSeqQGm_.SetGlobalBuffer((__gm__ int32_t *)params.cuSeqQlen);
         cuSeqKvGm_.SetGlobalBuffer((__gm__ int32_t *)params.cuSeqKvlen);
-        dqGm_.SetGlobalBuffer((__gm__ DataType *)params.dq);
-        dkGm_.SetGlobalBuffer((__gm__ DataType *)params.dk);
-        dvGm_.SetGlobalBuffer((__gm__ DataType *)params.dv);
 
         dqWorkspaceGm_.SetGlobalBuffer(
             (__gm__ float *)(params.workspace + tiling_->dqOffset));
@@ -92,8 +96,6 @@ public:
             (__gm__ float *)(params.workspace + tiling_->dkOffset));
         dvWorkspaceGm_.SetGlobalBuffer(
             (__gm__ float *)(params.workspace + tiling_->dvOffset));
-        deltaWorkspaceGm_.SetGlobalBuffer(
-            (__gm__ float *)(params.workspace + tiling_->deltaOffset));
 
         batchNum_ = static_cast<uint32_t>(tiling_->batch);
         qSeqlen_ = static_cast<uint32_t>(tiling_->qSeqlen);
@@ -111,6 +113,9 @@ public:
             static_cast<uint64_t>(coreNum_) * continuousBlockNum_;
         scaleValue_ = tiling_->scaleValue;
         softcapValue_ = tiling_->softcapValue;
+        softcapInputScale_ = IS_SOFTCAP
+            ? scaleValue_ / softcapValue_
+            : scaleValue_;
 
         // L1 layout:
         //   [P ping][P pong][dS ping][dS pong]
@@ -129,8 +134,8 @@ public:
         }
 
         // Per-AIV UB layout.  Ping and pong each own one complete half of UB:
-        //   ping: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)]
-        //   pong: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)]
+        //   ping: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)][dS(NZ, M+1 padding)][delta]
+        //   pong: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)][dS(NZ, M+1 padding)][delta]
         // Fixpipe SPLIT_M sends half of the logical M rows to each AIV.
         const uint32_t mAligned = RoundUp(qBlockSize_, 16);
         const uint32_t rowsPerSubBlock = mAligned / 2;
@@ -142,13 +147,18 @@ public:
             RoundUp(rowsPerSubBlock, 8) * 8U * sizeof(float);
         const uint32_t pTileBytes =
             (rowsPerSubBlock + 1) * kvBlockSize_ * sizeof(DataType);
+        const uint32_t dSTileBytes = pTileBytes;
+        const uint32_t deltaTileBytes =
+            rowsPerSubBlock * 8U * sizeof(float);
 
         const uint32_t mm1SlotOffset = 0;
         const uint32_t mm2SlotOffset = mm1SlotOffset + mmResTileBytes;
         const uint32_t attenMaskSlotOffset = mm2SlotOffset + mmResTileBytes;
         const uint32_t lseSlotOffset = RoundUp(attenMaskSlotOffset + attenMaskTileBytes, 32);
         const uint32_t pSlotOffset = RoundUp(lseSlotOffset + lseTileBytes, 32);
-        const uint32_t pingPongHalfBytes = RoundUp(pSlotOffset + pTileBytes, 32);
+        const uint32_t dSSlotOffset = RoundUp(pSlotOffset + pTileBytes, 32);
+        const uint32_t deltaSlotOffset = RoundUp(dSSlotOffset + dSTileBytes, 32);
+        const uint32_t pingPongHalfBytes = RoundUp(deltaSlotOffset + deltaTileBytes, 32);
 
         for (uint32_t i = 0; i < TASK_PINGPONG; ++i) {
             const uint32_t halfBaseOffset = i * pingPongHalfBytes;
@@ -167,6 +177,12 @@ public:
             ubPTensor[i] =
                 resource.ubBuf.template GetBufferByByte<DataType>(
                     halfBaseOffset + pSlotOffset);
+            ubDSTensor[i] =
+                resource.ubBuf.template GetBufferByByte<DataType>(
+                    halfBaseOffset + dSSlotOffset);
+            deltaUbTensor[i] =
+                resource.ubBuf.template GetBufferByByte<float>(
+                    halfBaseOffset + deltaSlotOffset);
         }
 
         if (batchNum_ != 0 && qBlockSize_ != 0 && kvBlockSize_ != 0) {
@@ -227,8 +243,16 @@ private:
     {
         vWaitMte2Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
         vWaitMte2Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
-        vWaitMte3Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
-        vWaitMte3Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        lseMte2WaitVPing = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+        lseMte2WaitVPong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+        deltaMte2WaitVPing = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+        deltaMte2WaitVPong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+        mte3WaitVPing = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        mte3WaitVPong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        pVWaitMte3Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
+        pVWaitMte3Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
+        dSVWaitMte3Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
+        dSVWaitMte3Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
     }
 
     CATLASS_DEVICE
@@ -445,7 +469,14 @@ private:
             qBlockSize_ == 0 || kvBlockSize_ == 0) {
             return;
         }
-
+#ifdef __DAV_CUBE__
+        BlockMmadSdP mm12(resource, Mm12L1Offset());
+        BlockMmaddQKV mm345(resource, Mm12L1Offset());
+        SetCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+        SetVecEvents();
+#endif
         uint64_t taskId = 0;
         for (uint32_t issueRound = 0;; ++issueRound) {
             const uint64_t blockBegin =
@@ -460,14 +491,20 @@ private:
                         // Drain the last task. There is no following task, so
                         // its L1 buffers do not need to be returned.
 #ifdef __DAV_CUBE__
-                        ProcessC5Stage(previousBlock_, false);
-                        ProcessC34Stage(previousBlock_, false);
+                        ProcessC5Stage(previousBlock_, false, mm345);
+                        ProcessC34Stage(previousBlock_, false, mm345);
 #endif
 #ifdef __DAV_VEC__
                         ProcessV1Stage(previousBlock_, subBlockIdx);
                         ProcessV2Stage(previousBlock_, subBlockIdx);
 #endif
                     }
+#ifdef __DAV_CUBE__
+                    WaitCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+                    WaitVecEvents();
+#endif
                     return;
                 }
                 block.taskId = taskId;
@@ -477,11 +514,11 @@ private:
 #ifdef __DAV_CUBE__
                 // Front-end MM of task i overlaps the vector and back-end MM
                 // stages of task i - 1.
-                ProcessC1Stage(block);
-                ProcessC2Stage(block);
+                ProcessC1Stage(block, mm12);
+                ProcessC2Stage(block, mm12);
                 if (taskId != 0) {
-                    ProcessC5Stage(previousBlock_, true);
-                    ProcessC34Stage(previousBlock_, true);
+                    ProcessC5Stage(previousBlock_, true, mm345);
+                    ProcessC34Stage(previousBlock_, true, mm345);
                 }
 #endif
 #ifdef __DAV_VEC__
@@ -499,47 +536,138 @@ private:
 
 #ifdef __DAV_CUBE__
     CATLASS_DEVICE
-    void ProcessC1Stage(FAGBlockInfo const &block)
+    void SetCubeEvents()
     {
-        // C1 actual computation and its completion notification stay together.
-        // TODO: Run C1 = Q * K^T for this block.
-        const uint32_t flagSlot =
-            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        const uint16_t flagId = SYNC_C1_TO_V1_FLAG[flagSlot];
+        // L0A ping/pong: 0/1
+        // L0B ping/pong: 2/3.
+        for (uint32_t eventId = 0; eventId < 4; ++eventId) {
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventId);
+        }
+        // mm12 and mm345 share the four physical L1-buffer tokens.
+        for (uint32_t eventId = 0; eventId < 4; ++eventId) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
+        }
+        // One availability token for every physical 64-KB L0C slot.
+        for (uint32_t eventId = 0;
+             eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM;
+             ++eventId) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(eventId);
+        }
+    }
+
+    CATLASS_DEVICE
+    void WaitCubeEvents()
+    {
+        for (uint32_t eventId = 0; eventId < 4; ++eventId) {
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventId);
+        }
+        for (uint32_t eventId = 0; eventId < 4; ++eventId) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
+        }
+        for (uint32_t eventId = 0;
+             eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM;
+             ++eventId) {
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(eventId);
+        }
+    }
+
+    CATLASS_DEVICE
+    void ProcessC1Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12)
+    {
+        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint16_t flagId = SYNC_C1_TO_V1_FLAG[slot];
+        auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend,
+            qkHeadDim_, qHeadNum_ * qkHeadDim_);
+        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
+            qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto sLayout = tla::MakeLayout(
+            tla::MakeShape(block.s1Extend, block.s2Extend),
+            tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
+        auto s = tla::MakeTensor(
+            ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
+        mm12(q, k, s, Catlass::GemmCoord(
+            block.s1Extend, block.s2Extend, qkHeadDim_));
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
-    void ProcessC2Stage(FAGBlockInfo const &block)
+    void ProcessC2Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12)
     {
-        // C2 actual computation and its completion notification stay together.
-        // TODO: Run C2 = dY * V^T for this block.
-        const uint32_t flagSlot =
-            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        const uint16_t flagId = SYNC_C2_TO_V2_FLAG[flagSlot];
+        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint16_t flagId = SYNC_C2_TO_V2_FLAG[slot];
+        auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend,
+            vHeadDim_, qHeadNum_ * vHeadDim_);
+        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend,
+            vHeadDim_, kvHeadNum_ * vHeadDim_);
+        auto dpLayout = tla::MakeLayout(
+            tla::MakeShape(block.s1Extend, block.s2Extend),
+            tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
+        auto dp = tla::MakeTensor(
+            ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
+        mm12(dy, v, dp, Catlass::GemmCoord(
+            block.s1Extend, block.s2Extend, vHeadDim_));
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
+    }
+
+    CATLASS_DEVICE
+    void ProcessC5Stage(
+        FAGBlockInfo const &block,
+        bool returnL1,
+        BlockMmaddQKV &mm345)
+    {
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+            SYNC_V1_TO_C5_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+            SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
+
+        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend,
+            vHeadDim_, qHeadNum_ * vHeadDim_);
+        auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
+            block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+
+        mm345.ComputeDv(l1PTensor[slot], dy, dv,
+            Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
+            true);
+
+        if (returnL1) {
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+                SYNC_C5_TO_V1_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
+                SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
+        }
     }
 
     CATLASS_DEVICE
     void ProcessC34Stage(
         FAGBlockInfo const &block,
-        bool returnL1)
+        bool returnL1,
+        BlockMmaddQKV &mm345)
     {
-        // Wait until both vector sub-blocks have produced dS in L1.
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
             SYNC_V2_TO_C34_FLAG);
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
             SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
 
-        // TODO: Run C3 = dS * K for this block.
-        // TODO: Run C4 = dS^T * Q for this block.
+        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
+            qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend,
+            qkHeadDim_, qHeadNum_ * qkHeadDim_);
+        auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset,
+            block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
+        auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
+            block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
 
-        // A following V2 stage needs an explicit ownership return before it
-        // can overwrite the single dS L1 buffer. The drained last task does not.
+        mm345.ComputeDqDk(
+            l1dSTensor[slot], k, q, dq, dk,
+            Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
+            true, true);
+
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
                 SYNC_C34_TO_V2_FLAG);
@@ -548,31 +676,51 @@ private:
         }
     }
 
+    template <class GlobalTensor>
     CATLASS_DEVICE
-    void ProcessC5Stage(
-        FAGBlockInfo const &block,
-        bool returnL1)
+    auto MakeGmTensor(GlobalTensor &gm, uint64_t offset,
+        uint32_t rows, uint64_t cols, uint64_t rowStride)
     {
-        // Wait until both vector sub-blocks have produced P in L1.
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V1_TO_C5_FLAG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
+        auto layout = tla::MakeLayout(
+            tla::MakeShape(rows, cols),
+            tla::MakeStride(rowStride, tla::Int<1>{}));
+        return tla::MakeTensor(gm[offset], layout, Catlass::Arch::PositionGM{});
+    }
 
-        // TODO: Run C5 = P^T * dY for this block.
-
-        // A following V1 stage needs an explicit ownership return before it
-        // can overwrite the single P L1 buffer. The drained last task does not.
-        if (returnL1) {
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C5_TO_V1_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
-        }
+    CATLASS_DEVICE
+    uint32_t Mm12L1Offset() const
+    {
+        return 2U * TASK_PINGPONG * qBlockSize_ * kvBlockSize_ * sizeof(DataType);
     }
 #endif
 
 #ifdef __DAV_VEC__
+    CATLASS_DEVICE
+    void SetVecEvents()
+    {
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(lseMte2WaitVPing);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(lseMte2WaitVPong);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(deltaMte2WaitVPing);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(deltaMte2WaitVPong);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pVWaitMte3Ping);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pVWaitMte3Pong);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(dSVWaitMte3Ping);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(dSVWaitMte3Pong);
+    }
+
+    CATLASS_DEVICE
+    void WaitVecEvents()
+    {
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(lseMte2WaitVPing);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(lseMte2WaitVPong);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(deltaMte2WaitVPing);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(deltaMte2WaitVPong);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(pVWaitMte3Ping);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(pVWaitMte3Pong);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(dSVWaitMte3Ping);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(dSVWaitMte3Pong);
+    }
+
     CATLASS_DEVICE
     void ProcessV1Stage(
         FAGBlockInfo const &block,
@@ -625,23 +773,29 @@ private:
             Catlass::Arch::PositionGM{});
 
         event_t mte2ToVEvent = flagSlot ? vWaitMte2Pong : vWaitMte2Ping;
-        event_t vToMte3Event = flagSlot ? vWaitMte3Pong : vWaitMte3Ping;
-
-        epilogueScaledMaskSoftmax_(
-            block,
-            attenMaskGmTensor,
-            softmaxLseGmTensor,
-            attenMaskUbTensor[flagSlot],
-            lseUbTensor[flagSlot],
-            ubMm1ResTensor[flagSlot],
-            ubPTensor[flagSlot],
-            l1PTensor[flagSlot],
-            mte2ToVEvent,
-            vToMte3Event,
-            scaleValue_,
-            softcapValue_,
-            subBlockRealS1,
-            subBlockIdx);
+        event_t vToMte2Event = flagSlot ? lseMte2WaitVPong : lseMte2WaitVPing;
+        event_t vToMte3Event = flagSlot ? mte3WaitVPong : mte3WaitVPing;
+        event_t mte3ToVEvent = flagSlot ? pVWaitMte3Pong : pVWaitMte3Ping;
+        if (subBlockRealS1 != 0U) {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
+            epilogueScaledMaskSoftmax_(
+                block,
+                attenMaskGmTensor,
+                softmaxLseGmTensor,
+                attenMaskUbTensor[flagSlot],
+                lseUbTensor[flagSlot],
+                ubMm1ResTensor[flagSlot],
+                ubPTensor[flagSlot],
+                l1PTensor[flagSlot],
+                mte2ToVEvent,
+                vToMte3Event,
+                mte3ToVEvent,
+                softcapInputScale_,
+                softcapValue_,
+                subBlockRealS1,
+                subBlockIdx);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
+        }
 
         // Notify C5 only after this vector sub-block has finished writing P.
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
@@ -666,16 +820,29 @@ private:
         }
         const uint32_t bufferId = flagSlot;
         event_t mte2ToVEvent = flagSlot ? vWaitMte2Pong : vWaitMte2Ping;
-        event_t vToMte3Event = flagSlot ? vWaitMte3Pong : vWaitMte3Ping;
-        epilogueSubMul_(
-            block,
-            ubMm2ResTensor[bufferId],
-            ubPTensor[bufferId],
-            lseUbTensor[bufferId], // delta reuse lseUB
-            l1dSTensor[bufferId],
-            mte2ToVEvent,
-            vToMte3Event,
-            subBlockIdx);
+        event_t vToMte2Event = flagSlot ? deltaMte2WaitVPong : deltaMte2WaitVPing;
+        event_t vToMte3Event = flagSlot ? mte3WaitVPong : mte3WaitVPing;
+        event_t mte3ToVEvent = flagSlot ? dSVWaitMte3Pong : dSVWaitMte3Ping;
+
+        const uint32_t subBlockRealS1 = subBlockIdx ?
+            block.s1Extend - block.firstHalfRealS1 :
+            block.firstHalfRealS1;
+        if (subBlockRealS1 != 0U) {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
+            epilogueSubMul_(
+                block,
+                ubMm2ResTensor[bufferId],
+                ubPTensor[bufferId],
+                ubMm1ResTensor[bufferId],
+                ubDSTensor[bufferId],
+                deltaUbTensor[bufferId],
+                l1dSTensor[bufferId],
+                mte2ToVEvent,
+                vToMte3Event,
+                mte3ToVEvent,
+                subBlockIdx);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
+        }
 
         // Notify C3/C4 only after this vector sub-block has finished writing dS.
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
@@ -696,18 +863,13 @@ private:
     AscendC::GlobalTensor<DataType> qGm_;
     AscendC::GlobalTensor<DataType> kGm_;
     AscendC::GlobalTensor<DataType> vGm_;
-    AscendC::GlobalTensor<DataType> outGm_;
     AscendC::GlobalTensor<uint8_t> attenMaskGm_;
     AscendC::GlobalTensor<float> softmaxLseGm_;
     AscendC::GlobalTensor<int32_t> cuSeqQGm_;
     AscendC::GlobalTensor<int32_t> cuSeqKvGm_;
-    AscendC::GlobalTensor<DataType> dqGm_;
-    AscendC::GlobalTensor<DataType> dkGm_;
-    AscendC::GlobalTensor<DataType> dvGm_;
     AscendC::GlobalTensor<float> dqWorkspaceGm_;
     AscendC::GlobalTensor<float> dkWorkspaceGm_;
     AscendC::GlobalTensor<float> dvWorkspaceGm_;
-    AscendC::GlobalTensor<float> deltaWorkspaceGm_;
 
     AscendC::LocalTensor<DataType> l1PTensor[TASK_PINGPONG];
     AscendC::LocalTensor<DataType> l1dSTensor[TASK_PINGPONG];
@@ -716,11 +878,21 @@ private:
     AscendC::LocalTensor<uint8_t> attenMaskUbTensor[TASK_PINGPONG];
     AscendC::LocalTensor<float> lseUbTensor[TASK_PINGPONG];
     AscendC::LocalTensor<DataType> ubPTensor[TASK_PINGPONG];
+    AscendC::LocalTensor<DataType> ubDSTensor[TASK_PINGPONG];
+    AscendC::LocalTensor<float> deltaUbTensor[TASK_PINGPONG];
 
     event_t vWaitMte2Ping;
     event_t vWaitMte2Pong;
-    event_t vWaitMte3Ping;
-    event_t vWaitMte3Pong;
+    event_t lseMte2WaitVPing;
+    event_t lseMte2WaitVPong;
+    event_t deltaMte2WaitVPing;
+    event_t deltaMte2WaitVPong;
+    event_t mte3WaitVPing;
+    event_t mte3WaitVPong;
+    event_t pVWaitMte3Ping;
+    event_t pVWaitMte3Pong;
+    event_t dSVWaitMte3Ping;
+    event_t dSVWaitMte3Pong;
 
     uint32_t batchNum_ = 0;
     uint32_t qSeqlen_ = 0;
@@ -737,6 +909,7 @@ private:
     uint64_t waveSize_ = 0;
     float scaleValue_ = 1.0f;
     float softcapValue_ = 0.0f;
+    float softcapInputScale_ = 1.0f;
 
     uint32_t decoderBatchIdx_ = 0;
     uint64_t decoderBatchBlockBegin_ = 0;
@@ -778,7 +951,30 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
     GM_ADDR workspace,
     GM_ADDR tiling)
 {
-    // TODO: 各个block待补充
+    using ArchTag = Catlass::Arch::Ascend950;
+    using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
+    using L0TileShape = tla::Shape<tla::Int<128>, tla::Int<128>, tla::Int<128>>;
+
+    using DispatchPolicySdP = Catlass::Gemm::MmadAscend950FagSdP<2, 2, false>;
+    using TileCopySdP = Catlass::Gemm::Tile::PackedTileCopyTlaToUB<
+        ArchTag,
+        DataType, Catlass::layout::RowMajor,
+        DataType, Catlass::layout::ColumnMajor,
+        float, Catlass::layout::RowMajor,
+        void, Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
+    using BlockMmadSdP = Catlass::Gemm::Block::BlockMmadTla<
+        DispatchPolicySdP, L1TileShape, L0TileShape,
+        DataType, DataType, float, void, TileCopySdP>;
+
+    using DispatchPolicydQKV = Catlass::Gemm::MmadAscend950FagdQKV<2, 2, false>;
+    using TileCopydQKV = Catlass::Gemm::Tile::PackedTileCopyTla<
+        ArchTag,
+        DataType, Catlass::layout::RowMajor,
+        DataType, Catlass::layout::RowMajor,
+        float, Catlass::layout::RowMajor>;
+    using BlockMmaddQKV = Catlass::Gemm::Block::BlockMmadTla<
+        DispatchPolicydQKV, L1TileShape, L0TileShape,
+        DataType, DataType, float, void, TileCopydQKV>;
 
     using DispatchPolicyScaledMaskSoftmax =
         Catlass::Epilogue::EpilogueAscend950FAGScaledMaskSoftmax<
@@ -790,7 +986,8 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
             float,
             FAGTiling950::FAGTilingData>;
     using DispatchPolicySubMul =
-        Catlass::Epilogue::EpilogueAscend950FAGSubMul<INPUT_LAYOUT>;
+        Catlass::Epilogue::EpilogueAscend950FAGSubMul<
+            INPUT_LAYOUT, IS_SOFTCAP>;
     using EpilogueSubMul =
         Catlass::Epilogue::Block::BlockEpilogue<
             DispatchPolicySubMul,
@@ -798,9 +995,10 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
             DataType,
             float,
             FAGTiling950::FAGTilingData>;
-
     using FAGKernel950 = FlashAttentionScoreGrad950<
         DataType,
+        BlockMmadSdP,
+        BlockMmaddQKV,
         EpilogueScaledMaskSoftmax,
         EpilogueSubMul,
         INPUT_LAYOUT,

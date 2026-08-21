@@ -72,6 +72,7 @@ public:
         TensorPL1 &l1PTensor,
         event_t mte2ToVEvent,
         event_t vToMte3Event,
+        event_t mte3ToVEvent,
         float scaleValue,
         float softcapValue,
         uint64_t s1RealSize,
@@ -84,7 +85,7 @@ public:
         // ubMm1Tensor: [s1RealSize, 128] * sizeof(fp32)
         // ubPTensor: [128 / C0, s1RealSize + 1, C0]
         // l1PTensor: [128 / C0, AlignUp(block.s1Extend, 16), C0]
-        
+
         // 1. Copy in attenMask (only support causal now)
         if constexpr (IS_ATTEN_MASK_) {
             const int64_t diagOffset =
@@ -141,6 +142,8 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
 
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
+
         // 3. scale + optional softcap + mask + exp(S-LSE) + Cast + Nd2Nz
         MulsMaskSimpleSoftmax<IS_ATTEN_MASK, IS_SOFTCAP>(
             reinterpret_cast<__ubuf__ ElementP *>(ubPTensor.GetPhyAddr()),
@@ -151,6 +154,9 @@ public:
             block.s2Extend,
             scaleValue,
             softcapValue);
+        if constexpr (IS_SOFTCAP) {
+            AscendC::PipeBarrier<PIPE_V>();
+        }
 
         // 4. UB --> L1
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
@@ -164,6 +170,8 @@ public:
         pCopyParams.srcStride = 1;
         pCopyParams.dstStride = static_cast<uint16_t>(l1M - s1RealSize);
         AscendC::DataCopy(l1PTensor[l1Offset], ubPTensor, pCopyParams);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
     }
 
 private:
@@ -171,8 +179,8 @@ private:
      * Rebuild P from the QK result and the LSE saved by forward:
      *
      *   logits = scaleValue * S
-     *   logits = softcap * tanh(logits)  (when enabled; host has already
-     *                                    set scaleValue = scale / softcap)
+     *   logits = softcap * tanh(logits)  (when enabled; the kernel passes
+     *                                    scaleValue = scale / softcap)
      *   P = exp(logits - LSE)
      *
      * A non-zero byte in maskUb denotes a masked element. S, mask, and P all
@@ -212,6 +220,8 @@ private:
         RegTensor<float> lseVreg;
         RegTensor<float> minVreg;
         RegTensor<float> softcapNumeratorVreg;
+        RegTensor<float> softcapGradVreg0;
+        RegTensor<float> softcapGradVreg1;
         RegTensor<ElementP> dstVreg0;
         RegTensor<ElementP> dstVreg1;
         RegTensor<ElementP> dstVreg;
@@ -237,23 +247,38 @@ private:
             Muls(srcVreg1, srcVreg1, scaleValue, pregTail1);
 
             if constexpr (HAS_SOFTCAP) {
-                // softcap * tanh(x), matching the forward logits. The lower
-                // clamp bounds exp(-2*x) without affecting
-                // the representable tanh result.
-                Duplicate(softcapNumeratorVreg, 2.0f * softcapValue);
+                // Compute tanh(x) once for both the reconstructed logits and
+                // the backward factor 1 - tanh(x)^2. The lower clamp bounds
+                // exp(-2*x) without affecting the representable tanh result.
+                Duplicate(softcapNumeratorVreg, 2.0f);
                 Maxs(srcVreg0, srcVreg0, -8.8f, pregTail0);
                 Muls(srcVreg0, srcVreg0, -2.0f, pregTail0);
                 Exp(srcVreg0, srcVreg0, pregTail0);
                 Adds(srcVreg0, srcVreg0, 1.0f, pregTail0);
                 Div(srcVreg0, softcapNumeratorVreg, srcVreg0, pregTail0);
-                Adds(srcVreg0, srcVreg0, -softcapValue, pregTail0);
+                Adds(srcVreg0, srcVreg0, -1.0f, pregTail0);
 
                 Maxs(srcVreg1, srcVreg1, -8.8f, pregTail1);
                 Muls(srcVreg1, srcVreg1, -2.0f, pregTail1);
                 Exp(srcVreg1, srcVreg1, pregTail1);
                 Adds(srcVreg1, srcVreg1, 1.0f, pregTail1);
                 Div(srcVreg1, softcapNumeratorVreg, srcVreg1, pregTail1);
-                Adds(srcVreg1, srcVreg1, -softcapValue, pregTail1);
+                Adds(srcVreg1, srcVreg1, -1.0f, pregTail1);
+
+                Mul(softcapGradVreg0, srcVreg0, srcVreg0, pregTail0);
+                Muls(softcapGradVreg0, softcapGradVreg0, -1.0f, pregTail0);
+                Adds(softcapGradVreg0, softcapGradVreg0, 1.0f, pregTail0);
+                Mul(softcapGradVreg1, srcVreg1, srcVreg1, pregTail1);
+                Muls(softcapGradVreg1, softcapGradVreg1, -1.0f, pregTail1);
+                Adds(softcapGradVreg1, softcapGradVreg1, 1.0f, pregTail1);
+                StoreAlign<float, StoreDist::DIST_NORM_B32>(
+                    srcUb + i * S2_ROW_STRIDE, softcapGradVreg0, pregTail0);
+                StoreAlign<float, StoreDist::DIST_NORM_B32>(
+                    srcUb + i * S2_ROW_STRIDE + FP32_PER_VREG,
+                    softcapGradVreg1, pregTail1);
+
+                Muls(srcVreg0, srcVreg0, softcapValue, pregTail0);
+                Muls(srcVreg1, srcVreg1, softcapValue, pregTail1);
             }
 
             if constexpr (HAS_ATTEN_MASK) {

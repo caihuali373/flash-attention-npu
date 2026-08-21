@@ -116,11 +116,6 @@ mha_bwd(
     fag_info.scaleValue = static_cast<float>(
         softmax_scale_.value_or(1.0 / std::sqrt(static_cast<double>(qk_head_dim))));
     const bool has_softcap = softcap > 0.0;
-    if (has_softcap) {
-        // Match Ascend910 FAG: the device scale is already normalized by
-        // softcap, so the epilogue only evaluates softcap * tanh(S * scale).
-        fag_info.scaleValue /= static_cast<float>(softcap);
-    }
     fag_info.softcapValue = static_cast<float>(softcap);
     fag_info.layout = is_varlen ? FAGTiling950::Layout::TND
                                 : FAGTiling950::Layout::BSND;
@@ -195,7 +190,6 @@ mha_bwd(
         FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data);
     TORCH_CHECK(tiling_status == 0,
                 "Ascend950 v3 bwd: arch35 GetFAGTilingParam failed");
-
     at::Tensor tiling_cpu = at::empty(
         {static_cast<int64_t>(sizeof(FAGTiling950::FAGTilingData))},
         at::device(c10::kCPU).dtype(at::kByte));
@@ -213,15 +207,38 @@ mha_bwd(
                 workspace_size <= static_cast<uint64_t>(
                     std::numeric_limits<int64_t>::max()),
                 "Ascend950 v3 bwd: invalid workspace size from tiling");
+    TORCH_CHECK(workspace_size % sizeof(float) == 0 &&
+                    fag_tiling_data.deltaOffset % sizeof(float) == 0,
+                "Ascend950 v3 bwd: FP32 workspace offsets must be aligned");
     at::Tensor workspace = at::empty(
-        {static_cast<int64_t>(workspace_size)},
-        at::device(at::kPrivateUse1).dtype(at::kByte));
+        {static_cast<int64_t>(workspace_size / sizeof(float))},
+        at::device(at::kPrivateUse1).dtype(at::kFloat));
 
-    // TODO：后续删掉
-    // Stable scaffold output until the real kernel writes gradients.
-    dq.zero_();
-    dk.zero_();
-    dv.zero_();
+    // --------------- TODO: 仅模拟Pre阶段调试用，后续真正pre上了删掉这段 ------------
+    workspace.zero_();
+
+    // Pre-processing currently lives on the host side. Produce delta before
+    // launching the mixed AIC/AIV FAG kernel.
+    //
+    // BSND: [B, S1, N1, Dv] -> [B, S1, N1]
+    // TND:  [T1, N1, Dv]    -> [T1, N1]
+    at::Tensor dout_cpu =
+        dout.to(at::Device(at::kCPU)).to(at::kFloat);
+    at::Tensor out_cpu =
+        out.to(at::Device(at::kCPU)).to(at::kFloat);
+    at::Tensor delta =
+        (dout_cpu * out_cpu).sum(-1).contiguous()
+            .to(at::Device(at::kPrivateUse1));
+    const uint64_t delta_element_count =
+        fag_info.totalQ * static_cast<uint64_t>(num_heads);
+    TORCH_CHECK(static_cast<uint64_t>(delta.numel()) == delta_element_count,
+                "Ascend950 v3 bwd: unexpected host-computed delta size");
+    workspace.narrow(
+        0,
+        static_cast<int64_t>(fag_tiling_data.deltaOffset / sizeof(float)),
+        static_cast<int64_t>(delta_element_count))
+        .copy_(delta.reshape({static_cast<int64_t>(delta_element_count)}));
+    // -----------------------------------------------------------------------------
 
     auto ptr = [](const at::Tensor &tensor) {
         return static_cast<uint8_t *>(tensor.data_ptr());
@@ -251,6 +268,11 @@ mha_bwd(
         mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
         mask = ptr(mask_npu_tensor);
     }
+
+    // -------------------- TODO：模拟pre阶段调测用 ------------------------
+    // Submit the PyTorch NPU tasks that produce workspace/delta before the
+    // raw mixed AIC/AIV kernel is launched directly on the ACL stream.
+    stream = c10_npu::getCurrentNPUStream().stream(true);
 
 #define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP) \
     FlashAttentionV3Bwd950<                                                     \
@@ -309,6 +331,30 @@ mha_bwd(
 
 #undef DISPATCH_BWD950_FLAGS
 #undef LAUNCH_BWD950
+
+    // ------------------------ TODO：仅模拟post阶段调测用，后续删了 ---------------------
+    // Post-processing currently lives on the host side. The main kernel
+    // accumulates FP32 gradients in workspace; enqueue scale/cast/copy after
+    // it on the same NPU stream.
+    const int64_t dq_element_count = static_cast<int64_t>(
+        fag_info.totalQ * fag_info.qHeadNum * fag_info.qkHeadDim);
+    const int64_t dk_element_count = static_cast<int64_t>(
+        fag_info.totalKv * fag_info.kvHeadNum * fag_info.qkHeadDim);
+    const int64_t dv_element_count = static_cast<int64_t>(
+        fag_info.totalKv * fag_info.kvHeadNum * fag_info.vHeadDim);
+    at::Tensor dq_workspace = workspace.narrow(
+        0, static_cast<int64_t>(fag_tiling_data.dqOffset / sizeof(float)),
+        dq_element_count).view(q.sizes());
+    at::Tensor dk_workspace = workspace.narrow(
+        0, static_cast<int64_t>(fag_tiling_data.dkOffset / sizeof(float)),
+        dk_element_count).view(k.sizes());
+    at::Tensor dv_workspace = workspace.narrow(
+        0, static_cast<int64_t>(fag_tiling_data.dvOffset / sizeof(float)),
+        dv_element_count).view(v.sizes());
+    dq.copy_(dq_workspace.mul(fag_info.scaleValue).to(q.scalar_type()));
+    dk.copy_(dk_workspace.mul(fag_info.scaleValue).to(k.scalar_type()));
+    dv.copy_(dv_workspace.to(v.scalar_type()));
+    // -------------------------------------------------------------------------------
 
     at::Tensor softmax_d = is_varlen
         ? at::empty({num_heads, q.size(0)}, q.options().dtype(at::kFloat))

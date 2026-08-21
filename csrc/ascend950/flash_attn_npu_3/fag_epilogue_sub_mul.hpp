@@ -25,26 +25,28 @@ namespace Catlass::Epilogue::Block {
  *     -> this BlockEpilogue::operator()
  *
  * Intended data path:
- *   C2 dP UB + V1 P UB + delta GM -> dS = P * (dP - delta) -> dS L1.
+ *   C2 dP UB + V1 P UB + delta GM
+ *     -> dS = P * (dP - delta) * optional(1 - tanh(x)^2) -> dS L1.
  *
  * Only the interface and type wiring are provided for now. ProcessV2Stage
  * owns the cross-core ready/return handshake around this implementation.
  */
 template <
     FAGTiling950::Layout INPUT_LAYOUT_,
+    bool IS_SOFTCAP_,
     class ElementDS_,
     class ElementP_,
     class ElementDP_,
     class TilingData_>
 class BlockEpilogue<
-    EpilogueAscend950FAGSubMul<INPUT_LAYOUT_>,
+    EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>,
     ElementDS_,
     ElementP_,
     ElementDP_,
     TilingData_> {
 public:
     using DispatchPolicy =
-        EpilogueAscend950FAGSubMul<INPUT_LAYOUT_>;
+        EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementDS = ElementDS_;
     using ElementP = ElementP_;
@@ -52,6 +54,7 @@ public:
     using TilingData = TilingData_;
 
     static constexpr FAGTiling950::Layout INPUT_LAYOUT = INPUT_LAYOUT_;
+    static constexpr bool IS_SOFTCAP = IS_SOFTCAP_;
 
     CATLASS_DEVICE
     BlockEpilogue() = default;
@@ -69,16 +72,24 @@ public:
                 workspace + tiling_->deltaOffset));
     }
 
-    template <class TensorDP, class TensorP, class TensorDelta, class TensorDS>
+    template <
+        class TensorDP,
+        class TensorP,
+        class TensorSoftcapGrad,
+        class TensorDelta,
+        class TensorDS>
     CATLASS_DEVICE
     void operator()(
         FAGBlockInfo const &block,
         TensorDP const &ubDPTensor,
         TensorP const &ubPTensor,
+        TensorSoftcapGrad const &ubSoftcapGradTensor,
+        TensorDS &ubDSTensor,
         TensorDelta &deltaUbTensor,
         TensorDS &l1DSTensor,
         event_t mte2ToVEvent,
         event_t vToMte3Event,
+        event_t mte3ToVEvent,
         uint32_t subBlockIdx)
     {
         using namespace AscendC::MicroAPI;
@@ -114,10 +125,14 @@ public:
 
         auto dp = reinterpret_cast<__ubuf__ ElementDP *>(ubDPTensor.GetPhyAddr());
         auto p = reinterpret_cast<__ubuf__ ElementP *>(ubPTensor.GetPhyAddr());
-        auto out = reinterpret_cast<__ubuf__ ElementDS *>(ubPTensor.GetPhyAddr());
+        auto softcapGrad = reinterpret_cast<__ubuf__ float *>(
+            ubSoftcapGradTensor.GetPhyAddr());
+        auto out = reinterpret_cast<__ubuf__ ElementDS *>(ubDSTensor.GetPhyAddr());
         auto delta = reinterpret_cast<__ubuf__ float *>(deltaUbTensor.GetPhyAddr());
 
-        ComputeSubMul(dp, p, delta, out, m);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
+
+        ComputeSubMul(dp, p, softcapGrad, delta, out, m);
         AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
@@ -129,13 +144,16 @@ public:
             static_cast<uint16_t>(rowStride / c0),
             static_cast<uint16_t>(m), 1,
             static_cast<uint16_t>(l1M - m)};
-        AscendC::DataCopy(l1DSTensor[l1Offset], ubPTensor, copyParams);
+        AscendC::DataCopy(l1DSTensor[l1Offset], ubDSTensor, copyParams);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
     }
 
 private:
     __simd_vf__ inline static void ComputeSubMul(
         __ubuf__ ElementDP *dp, __ubuf__ ElementP *p,
-        __ubuf__ float *delta, __ubuf__ ElementDS *out, uint32_t m)
+        __ubuf__ float *softcapGrad, __ubuf__ float *delta,
+        __ubuf__ ElementDS *out, uint32_t m)
     {
         using namespace AscendC::MicroAPI;
         constexpr uint32_t rowStride = 128;
@@ -145,6 +163,7 @@ private:
         RegTensor<float> dp0, dp1;
         RegTensor<ElementP> pPacked;
         RegTensor<float> pEven, pOdd, p0f, p1f, deltaV, r0, r1;
+        RegTensor<float> softcapGrad0, softcapGrad1;
         RegTensor<float> rEven, rOdd;
         RegTensor<ElementDS> oEven, oOdd, oPacked;
         MaskReg fullDp = CreateMask<float, MaskPattern::ALL>();
@@ -177,6 +196,13 @@ private:
             Sub(r1, dp1, deltaV, fullDp);
             Mul(r0, r0, p0f, fullDp);
             Mul(r1, r1, p1f, fullDp);
+            if constexpr (IS_SOFTCAP) {
+                LoadAlign(softcapGrad0, softcapGrad + i * rowStride);
+                LoadAlign(softcapGrad1,
+                    softcapGrad + i * rowStride + lanes);
+                Mul(r0, r0, softcapGrad0, fullDp);
+                Mul(r1, r1, softcapGrad1, fullDp);
+            }
             DeInterleave(rEven, rOdd, r0, r1);
             Cast<ElementDS, float, b32ToB16Even>(oEven, rEven, fullOut);
             Cast<ElementDS, float, b32ToB16Odd>(oOdd, rOdd, fullOut);
