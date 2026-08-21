@@ -51,14 +51,15 @@ public:
         event_t vToMte3Pong)
     {
         const uint64_t dqCount = static_cast<uint64_t>(tiling_->totalQ) * tiling_->qHeadNum * tiling_->qkHeadDim;
-        const uint64_t dkvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
+        const uint64_t dkCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
+        const uint64_t dvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->vHeadDim;
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Ping);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Pong);
         uint32_t pingPongIdx = 0;
-        ProcessRegion<false>(dvGm_, dvWorkspace_, dkvCount, 1.0F,
+        ProcessRegion<false>(dvGm_, dvWorkspace_, dvCount, 1.0F,
             vectorCoreId, vectorCoreNum, pingPongIdx, mte3ToMte2Ping, mte3ToMte2Pong,
             mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
-        ProcessRegion<true>(dkGm_, dkWorkspace_, dkvCount, tiling_->scaleValue,
+        ProcessRegion<true>(dkGm_, dkWorkspace_, dkCount, tiling_->scaleValue,
             vectorCoreId, vectorCoreNum, pingPongIdx, mte3ToMte2Ping, mte3ToMte2Pong,
             mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
         ProcessRegion<true>(dqGm_, dqWorkspace_, dqCount, tiling_->scaleValue,

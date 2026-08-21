@@ -38,10 +38,11 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
 
         const uint64_t dqCount = static_cast<uint64_t>(tiling_->totalQ) * tiling_->qHeadNum * tiling_->qkHeadDim;
-        const uint64_t dkvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
+        const uint64_t dkCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
+        const uint64_t dvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->vHeadDim;
         ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);
-        ClearRegion(dkWorkspace_, dkvCount, vectorCoreId, vectorCoreNum);
-        ClearRegion(dvWorkspace_, dkvCount, vectorCoreId, vectorCoreNum);
+        ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
+        ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
     }
 
 private:

@@ -35,8 +35,8 @@ else:
 
 
 def _maybe_contiguous(x):
-    """Make sure the inner-most stride is 1; the kernel asserts it."""
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    """Make tensors fully contiguous for kernels that use linear GM offsets."""
+    return x.contiguous() if x is not None and not x.is_contiguous() else x
 
 @_torch_custom_op_wrapper(
     "flash_attn_npu_3_950_C::_flash_attn_forward", mutates_args=(), device_types="npu"
