@@ -1,6 +1,9 @@
 # Copyright (c) 2026, Minghua Shen.
 """
-小算子 FlashAttention 反向标杆（传入 FA 前向 out/lse，仅算反传）。
+小算子 FlashAttention 正/反向标杆。
+
+- 正向：独立计算 out / softmax_lse
+- 反向：传入 FA 前向 out/lse，仅算反传（golden_*_bwd_from_fwd）
 
 供 test_flash_attn_npu_v2_bwd.py / test_flash_attn_npu_v3_bwd.py 使用。
 """
@@ -180,6 +183,7 @@ def tbackward_bsnd(dx, q, k, v, softmax_res, drop_mask, scale, softcap, dropout_
     softcap_factor = _softcap_backward_factor(q, k, scale, softcap, q.dtype)
     if softcap_factor is not None:
         softmax_grad_res = softmax_grad_res * softcap_factor
+    softmax_grad_res = softmax_grad_res.to(k.dtype)
     dq = torch.matmul(softmax_grad_res, k)
     dk = torch.matmul(softmax_grad_res.permute(0, 1, 3, 2), q)
     return dq, dk, dv
@@ -199,6 +203,7 @@ def tbackward_tnd(dx, q, k, v, softmax_res, drop_mask, scale, softcap, dropout_p
     softcap_factor = _softcap_backward_factor(q, k, scale, softcap, q.dtype)
     if softcap_factor is not None:
         softmax_grad_res = softmax_grad_res * softcap_factor
+    softmax_grad_res = softmax_grad_res.to(k.dtype)
     dq = torch.matmul(softmax_grad_res, k)
     dk = torch.matmul(softmax_grad_res.permute(0, 1, 3, 2), q)
     return dq, dk, dv
@@ -351,3 +356,153 @@ def golden_tnd_bwd_from_fwd(
         )
 
     return dq_golden, dk_golden, dv_golden
+
+
+def _fwd_single_bn(
+    q_bn,
+    k_bn,
+    v_bn,
+    scale,
+    softcap,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    compute_dtype,
+    *,
+    gtype=torch.float64,
+):
+    """单 batch BN 前向。q/k/v: (1, N, S, D)。返回 out (1,N,Sq,D)、lse (1,N,Sq)。"""
+    atten_mask = _resolve_atten_mask(
+        q_bn, k_bn, None, is_causal, window_size_left, window_size_right
+    )
+    qb = q_bn.to(gtype)
+    kb = k_bn.to(gtype)
+    vb = v_bn.to(gtype)
+    qk = torch.matmul(qb, kb.permute(0, 1, 3, 2)).to(torch.float32).mul(scale)
+    if softcap > 0.0:
+        qk = softcap * torch.tanh(qk / softcap)
+    if atten_mask is not None and len(atten_mask.shape) != 0:
+        qk = qk + atten_mask.to(torch.float32) * (-40000.0)
+    qk_g = qk.to(gtype)
+    row_max = torch.amax(qk_g, dim=-1, keepdim=True)
+    p = torch.exp(qk_g - row_max)
+    if atten_mask is not None and len(atten_mask.shape) != 0:
+        p = p.masked_fill(atten_mask.bool().broadcast_to(p.shape), 0)
+    row_sum = torch.sum(p, dim=-1, keepdim=True).clamp_min(1e-20)
+    out = torch.matmul(p.to(gtype), vb) / row_sum
+    lse = (torch.log(row_sum.squeeze(-1)) + row_max.squeeze(-1)).to(torch.float32)
+    if atten_mask is not None and len(atten_mask.shape) != 0:
+        # atten_mask: (Sq, Sk); fully masked query rows -> out=0, lse=+inf
+        fully_masked = atten_mask.bool().reshape(atten_mask.shape[-2], atten_mask.shape[-1]).all(dim=-1)
+        out = out.clone()
+        lse = lse.clone()
+        out[:, :, fully_masked, :] = 0
+        lse[:, :, fully_masked] = float("inf")
+    return out.to(compute_dtype), lse
+
+
+def golden_bsnd_fwd(
+    q,
+    k,
+    v,
+    nheads,
+    nheads_k,
+    scale,
+    softcap,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    *,
+    gtype=torch.float64,
+):
+    """BSND 前向标杆。返回 out (B,Sq,N,D)、lse (B,N,Sq)。"""
+    batch, seq_q, _, headdim = q.shape
+    compute_dtype = q.dtype
+    q_bn = q.detach().cpu().permute(0, 2, 1, 3).to(gtype)
+    k_bn = k.detach().cpu().permute(0, 2, 1, 3).to(gtype)
+    v_bn = v.detach().cpu().permute(0, 2, 1, 3).to(gtype)
+    if nheads != nheads_k:
+        k_bn = broadcast_kv_single(nheads, nheads_k, k_bn, gtype)
+        v_bn = broadcast_kv_single(nheads, nheads_k, v_bn, gtype)
+
+    outs = []
+    lses = []
+    for b in range(batch):
+        out_b, lse_b = _fwd_single_bn(
+            q_bn[b : b + 1],
+            k_bn[b : b + 1],
+            v_bn[b : b + 1],
+            scale,
+            softcap,
+            is_causal,
+            window_size_left,
+            window_size_right,
+            compute_dtype,
+            gtype=gtype,
+        )
+        outs.append(out_b.permute(0, 2, 1, 3).reshape(seq_q, nheads, headdim))
+        lses.append(lse_b.reshape(nheads, seq_q))
+    out = torch.stack(outs, dim=0)  # (B, Sq, N, D)
+    lse = torch.stack(lses, dim=0)  # (B, N, Sq)
+    return out, lse
+
+
+def golden_tnd_fwd(
+    q,
+    k,
+    v,
+    nheads,
+    nheads_k,
+    seqlens_q,
+    seqlens_k,
+    scale,
+    softcap,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    *,
+    gtype=torch.float64,
+):
+    """TND 前向标杆。返回 out (total_q,N,D)、lse (N,total_q) NT。"""
+    seqlens_q = list(seqlens_q)
+    seqlens_k = list(seqlens_k)
+    cu_q = [0]
+    cu_k = [0]
+    for sq, sk in zip(seqlens_q, seqlens_k):
+        cu_q.append(cu_q[-1] + int(sq))
+        cu_k.append(cu_k[-1] + int(sk))
+    headdim = q.shape[-1]
+    compute_dtype = q.dtype
+    total_q = cu_q[-1]
+    out = torch.empty((total_q, nheads, headdim), dtype=compute_dtype)
+    lse = torch.empty((nheads, total_q), dtype=torch.float32)
+
+    for i, sq in enumerate(seqlens_q):
+        sk = seqlens_k[i]
+        if sq == 0:
+            continue
+        if sk == 0:
+            out[cu_q[i] : cu_q[i + 1]] = 0
+            lse[:, cu_q[i] : cu_q[i + 1]] = float("inf")
+            continue
+        qi = q[cu_q[i] : cu_q[i + 1]].detach().cpu().unsqueeze(0).permute(0, 2, 1, 3).to(gtype)
+        ki = k[cu_k[i] : cu_k[i + 1]].detach().cpu().unsqueeze(0).permute(0, 2, 1, 3).to(gtype)
+        vi = v[cu_k[i] : cu_k[i + 1]].detach().cpu().unsqueeze(0).permute(0, 2, 1, 3).to(gtype)
+        if nheads != nheads_k:
+            ki = broadcast_kv_single(nheads, nheads_k, ki, gtype)
+            vi = broadcast_kv_single(nheads, nheads_k, vi, gtype)
+        out_b, lse_b = _fwd_single_bn(
+            qi,
+            ki,
+            vi,
+            scale,
+            softcap,
+            is_causal,
+            window_size_left,
+            window_size_right,
+            compute_dtype,
+            gtype=gtype,
+        )
+        out[cu_q[i] : cu_q[i + 1]] = out_b.permute(0, 2, 1, 3).reshape(sq, nheads, headdim)
+        lse[:, cu_q[i] : cu_q[i + 1]] = lse_b.reshape(nheads, sq)
+    return out, lse
