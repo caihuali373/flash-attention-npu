@@ -126,6 +126,13 @@ struct FAGBlockInfo {
     uint64_t kOffset = 0;
     uint64_t vOffset = 0;
     uint64_t doutOffset = 0;
+
+    // KV-group residency / local dk,dv accumulate control.
+    // One AIC owns a full (batch, n2, s2Block) group so K/V stay in L1 and
+    // dk/dv can accumulate in L0C until the last s1 of the group.
+    bool loadKv = true;
+    bool flushDkv = true;
+    bool initDkv = true;
 };
 
 // Device-kernel argument bundle. Keep it in this header together with the
