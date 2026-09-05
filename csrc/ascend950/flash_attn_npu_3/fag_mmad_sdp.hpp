@@ -16,6 +16,8 @@
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 
+#include "fag_block.h"
+
 namespace Catlass::Gemm::Block {
 
 template <
@@ -93,13 +95,22 @@ public:
     static_assert(L0C_STAGES == Ascend950FagL0CLayout::L0C_SDP_SLOT_NUM, "SdP must use exactly 2 L0C slots");
     static_assert(L0C_STAGES * L0C_BUF_SIZE <= ArchTag::L0C_SIZE / 2, "SdP L0C must stay in low 128KB");
 
-    // L1 partitions: Q / K^T / dY / V^T, each up to 128x256
     static constexpr uint32_t L1_TILE_MAX = BASE * 256 * sizeof(ElementA);
-    static constexpr uint32_t L1_Q_OFFSET = 0;
-    static constexpr uint32_t L1_K_OFFSET = L1_TILE_MAX;
-    static constexpr uint32_t L1_DY_OFFSET = L1_TILE_MAX * 2;
-    static constexpr uint32_t L1_V_OFFSET = L1_TILE_MAX * 3;
-    static_assert(L1_V_OFFSET + L1_TILE_MAX <= ArchTag::L1_SIZE, "L1 overflow");
+    static constexpr uint32_t L1_KT_OFFSET =
+        Ascend950FagL1Layout::SLOT_RES_KT * L1_TILE_MAX;
+    static constexpr uint32_t L1_VT_OFFSET =
+        Ascend950FagL1Layout::SLOT_RES_VT * L1_TILE_MAX;
+    static constexpr uint32_t L1_Q_OFFSET =
+        Ascend950FagL1Layout::SLOT_WORK_Q * L1_TILE_MAX;
+    static constexpr uint32_t L1_DY_OFFSET =
+        Ascend950FagL1Layout::SLOT_WORK_DY * L1_TILE_MAX;
+    static constexpr uint32_t L1_EVENT_KT = Ascend950FagL1Layout::SLOT_RES_KT;
+    static constexpr uint32_t L1_EVENT_VT = Ascend950FagL1Layout::SLOT_RES_VT;
+    static constexpr uint32_t L1_EVENT_Q = Ascend950FagL1Layout::SLOT_WORK_Q;
+    static constexpr uint32_t L1_EVENT_DY = Ascend950FagL1Layout::SLOT_WORK_DY;
+    static_assert(
+        Ascend950FagL1Layout::SLOT_COUNT * L1_TILE_MAX <= ArchTag::L1_SIZE,
+        "L1 overflow");
     static_assert(Ascend950FagL0CLayout::L0C_SLOT_NUM * L0C_BUF_SIZE <= ArchTag::L0C_SIZE, "L0C overflow");
 
     CATLASS_DEVICE
@@ -110,10 +121,10 @@ public:
         }
         AscendC::SetHF32Mode(false);
 
+        l1KT = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_KT_OFFSET);
+        l1VT = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_VT_OFFSET);
         l1Q = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + L1_Q_OFFSET);
-        l1K = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_K_OFFSET);
         l1Dy = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + L1_DY_OFFSET);
-        l1V = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_V_OFFSET);
 
         for (uint32_t i = 0; i < L0AB_STAGES; i++) {
             l0ATensorList[i] = resource.l0ABuf.template GetBufferByByte<ElementA>(L0A_PINGPONG_BUF_SIZE * i);
@@ -122,10 +133,11 @@ public:
             l0BEventList[i] = static_cast<int32_t>(i + L0AB_STAGES + eventIdStart);
         }
         for (uint32_t i = 0; i < L0C_STAGES; i++) {
-            l0CTensorList[i] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(L0C_BUF_SIZE * i);
+            l0CTensorList[i] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(
+                L0C_BUF_SIZE * (Ascend950FagL0CLayout::SLOT_SDP_0 + i));
             l0CEventList[i] = static_cast<int32_t>((Ascend950FagL0CLayout::SLOT_SDP_0 + i + eventIdStart) % 8);
         }
-        for (uint32_t i = 0; i < 4; i++) {
+        for (uint32_t i = 0; i < Ascend950FagL1Layout::SLOT_COUNT; i++) {
             l1EventList[i] = static_cast<int32_t>((i + eventIdStart) % 8);
         }
         l0AListId = 0;
@@ -137,14 +149,13 @@ public:
     ~BlockMmadTla() {}
 
     /**
-     * Calc: C = A * B^T, Fixpipe L0C -> UB.
-     * actualShape = (sqActual, skvActual, dActual).
-     * A: RowMajor [Sq, D]; B: RowMajor [Skv, D] (consumed as B^T).
-     * tensorC is a UB RowMajor destination.
+     * S = Q * K^T. K^T stays resident in L1 across s1 of the same s2 group when
+     * loadK == false.
      */
     template <class TensorA, class TensorB, class TensorC>
     CATLASS_DEVICE
-    void operator()(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape)
+    void ComputeS(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC,
+        GemmCoord const& actualShape, bool loadK)
     {
         uint32_t sqActual = actualShape.m();
         uint32_t skvActual = actualShape.n();
@@ -155,12 +166,64 @@ public:
         uint32_t dRound = RoundUp<L1AAlignHelper::K_ALIGNED>(dActual);
 
         uint32_t slotC = l0CListId;
-        CopyGmToL1A(l1Q, tensorA, sqActual, dActual, sqRound, dRound, 0);
-        CopyGmToL1BT(l1K, tensorB, dActual, skvActual, dRound, skvRound, 1);
-        GemmABt(l1Q, l1K, l0CTensorList[slotC],
-            sqRound, skvRound, dRound, sqActual, skvActual, dActual, slotC, 0, 1);
+        CopyGmToL1A(l1Q, tensorA, sqActual, dActual, sqRound, dRound, L1_EVENT_Q);
+        if (loadK) {
+            CopyGmToL1BT(l1KT, tensorB, dActual, skvActual, dRound, skvRound, L1_EVENT_KT);
+        }
+        GemmABt(l1Q, l1KT, l0CTensorList[slotC],
+            sqRound, skvRound, dRound, sqActual, skvActual, dActual,
+            slotC, L1_EVENT_Q, L1_EVENT_KT, /*waitB=*/loadK, /*releaseB=*/false);
         FixpipeUb(tensorC, l0CTensorList[slotC], sqActual, skvActual, sqRound, slotC);
         l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
+    }
+
+    /**
+     * dP = dY * V^T. V^T stays resident when loadV == false.
+     */
+    template <class TensorA, class TensorB, class TensorC>
+    CATLASS_DEVICE
+    void ComputeDP(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC,
+        GemmCoord const& actualShape, bool loadV)
+    {
+        uint32_t sqActual = actualShape.m();
+        uint32_t skvActual = actualShape.n();
+        uint32_t dActual = actualShape.k();
+
+        uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
+        uint32_t skvRound = RoundUp<L1BAlignHelper::N_ALIGNED>(skvActual);
+        uint32_t dRound = RoundUp<L1AAlignHelper::K_ALIGNED>(dActual);
+
+        uint32_t slotC = l0CListId;
+        CopyGmToL1A(l1Dy, tensorA, sqActual, dActual, sqRound, dRound, L1_EVENT_DY);
+        if (loadV) {
+            CopyGmToL1BT(l1VT, tensorB, dActual, skvActual, dRound, skvRound, L1_EVENT_VT);
+        }
+        GemmABt(l1Dy, l1VT, l0CTensorList[slotC],
+            sqRound, skvRound, dRound, sqActual, skvActual, dActual,
+            slotC, L1_EVENT_DY, L1_EVENT_VT, /*waitB=*/loadV, /*releaseB=*/false);
+        FixpipeUb(tensorC, l0CTensorList[slotC], sqActual, skvActual, sqRound, slotC);
+        l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
+    }
+
+    CATLASS_DEVICE
+    void ReleaseResidentKT()
+    {
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[L1_EVENT_KT]);
+    }
+
+    CATLASS_DEVICE
+    void ReleaseResidentVT()
+    {
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[L1_EVENT_VT]);
+    }
+
+    // Backward-compatible entry: always reload both operands.
+    template <class TensorA, class TensorB, class TensorC>
+    CATLASS_DEVICE
+    void operator()(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape)
+    {
+        ComputeS(tensorA, tensorB, tensorC, actualShape, true);
+        ReleaseResidentKT();
     }
 
 protected:
@@ -217,7 +280,8 @@ protected:
         AscendC::LocalTensor<ElementAccumulator> l0C,
         uint32_t mRound, uint32_t nRound, uint32_t kRound,
         uint32_t mActual, uint32_t nActual, uint32_t kActual,
-        uint32_t l0cSlot, uint32_t l1AEvent, uint32_t l1BEvent)
+        uint32_t l0cSlot, uint32_t l1AEvent, uint32_t l1BEvent,
+        bool waitB, bool releaseB)
     {
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(mRound, kRound);
         auto layoutBInL1 = tla::MakeLayout<ElementB, LayoutTagL1B>(kRound, nRound);
@@ -227,7 +291,9 @@ protected:
         auto tensorL0C = tla::MakeTensor(l0C, layoutCInL0, Arch::PositionL0C{});
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1AEvent]);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
+        if (waitB) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
+        }
         if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0cSlot]);
         }
@@ -271,7 +337,9 @@ protected:
         }
 
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1AEvent]);
-        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
+        if (releaseB) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
+        }
     }
 
     template <class TensorUb>
@@ -299,9 +367,9 @@ protected:
     }
 
     AscendC::LocalTensor<ElementA> l1Q;
-    AscendC::LocalTensor<ElementB> l1K;
+    AscendC::LocalTensor<ElementB> l1KT;
     AscendC::LocalTensor<ElementA> l1Dy;
-    AscendC::LocalTensor<ElementB> l1V;
+    AscendC::LocalTensor<ElementB> l1VT;
 
     AscendC::LocalTensor<ElementA> l0ATensorList[L0AB_STAGES];
     AscendC::LocalTensor<ElementB> l0BTensorList[L0AB_STAGES];
@@ -310,7 +378,7 @@ protected:
     int32_t l0AEventList[L0AB_STAGES];
     int32_t l0BEventList[L0AB_STAGES];
     int32_t l0CEventList[L0C_STAGES];
-    int32_t l1EventList[4];
+    int32_t l1EventList[Ascend950FagL1Layout::SLOT_COUNT];
 
     uint32_t l0AListId{0};
     uint32_t l0BListId{0};

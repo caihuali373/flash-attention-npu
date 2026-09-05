@@ -16,6 +16,8 @@
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 
+#include "fag_block.h"
+
 namespace Catlass::Gemm::Block {
 
 template <
@@ -102,11 +104,18 @@ public:
     static constexpr uint32_t SLOT_DV = Ascend950FagL0CLayout::SLOT_DV;
 
     static constexpr uint32_t L1_TILE_MAX = BASE * 256 * sizeof(ElementA);
-    static constexpr uint32_t L1_K_OFFSET = 0;
-    static constexpr uint32_t L1_Q_OFFSET = L1_TILE_MAX;
-    static constexpr uint32_t L1_DY_OFFSET = L1_TILE_MAX * 2;
-    static constexpr uint32_t L1_BUFFER_COUNT = 3;
-    static_assert(L1_DY_OFFSET + L1_TILE_MAX <= ArchTag::L1_SIZE, "L1 overflow");
+    static constexpr uint32_t L1_K_OFFSET =
+        Ascend950FagL1Layout::SLOT_RES_K * L1_TILE_MAX;
+    static constexpr uint32_t L1_Q_OFFSET =
+        Ascend950FagL1Layout::SLOT_WORK_Q * L1_TILE_MAX;
+    static constexpr uint32_t L1_DY_OFFSET =
+        Ascend950FagL1Layout::SLOT_WORK_DY * L1_TILE_MAX;
+    static constexpr uint32_t L1_EVENT_K = Ascend950FagL1Layout::SLOT_RES_K;
+    static constexpr uint32_t L1_EVENT_Q = Ascend950FagL1Layout::SLOT_WORK_Q;
+    static constexpr uint32_t L1_EVENT_DY = Ascend950FagL1Layout::SLOT_WORK_DY;
+    static_assert(
+        Ascend950FagL1Layout::SLOT_COUNT * L1_TILE_MAX <= ArchTag::L1_SIZE,
+        "L1 overflow");
     static_assert(L0C_STAGES * L0C_BUF_SIZE <= ArchTag::L0C_SIZE, "L0C overflow");
 
     CATLASS_DEVICE
@@ -126,7 +135,7 @@ public:
             l0CTensorList[i] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(L0C_BUF_SIZE * i);
             l0CEventList[i] = static_cast<int32_t>((i + eventIdStart) % 8);
         }
-        for (uint32_t i = 0; i < L1_BUFFER_COUNT; i++) {
+        for (uint32_t i = 0; i < Ascend950FagL1Layout::SLOT_COUNT; i++) {
             l1EventList[i] = static_cast<int32_t>((i + eventIdStart) % 8);
         }
         l0AListId = 0;
@@ -136,6 +145,31 @@ public:
     CATLASS_DEVICE
     ~BlockMmadTla() {}
 
+    /// Prefetch RowMajor K into the resident L1 slot for dQ = dS * K.
+    template <class TensorK>
+    CATLASS_DEVICE
+    void LoadResidentK(TensorK& k, uint32_t skvActual, uint32_t dActual)
+    {
+        const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
+        const uint32_t dRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dActual);
+        if (dActual <= BASE) {
+            CopyGmToL1B(l1K, k, skvActual, dActual, skvRound, dRound, L1_EVENT_K);
+        } else {
+            // Large-D: keep first BASE-wide slice resident; remaining slices
+            // still stream from GM inside ComputeDqDkLargeHeadDim.
+            auto kTile = GetTile(k, tla::MakeCoord(0u, 0u),
+                tla::MakeShape(skvActual, BASE));
+            const uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(BASE);
+            CopyGmToL1B(l1K, kTile, skvActual, BASE, skvRound, nRound, L1_EVENT_K);
+        }
+    }
+
+    CATLASS_DEVICE
+    void ReleaseResidentK()
+    {
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[L1_EVENT_K]);
+    }
+
     template <class TensorK, class TensorQ, class TensorDq, class TensorDk>
     CATLASS_DEVICE
     void ComputeDqDk(
@@ -143,17 +177,20 @@ public:
         TensorK& k, TensorQ& q,
         TensorDq& dq, TensorDk& dk,
         GemmCoord const& actualShape,
-        bool enAtomicDq, bool enAtomicDk)
+        bool loadK, bool enAtomicDq,
+        bool initDk, bool flushDk, bool enAtomicDk)
     {
         const uint32_t sqActual = actualShape.m();
         const uint32_t dActual = actualShape.n();
         const uint32_t skvActual = actualShape.k();
         if (dActual <= BASE) {
             ComputeDqDkSmallHeadDim(dsNz, k, q, dq, dk,
-                sqActual, skvActual, dActual, enAtomicDq, enAtomicDk);
+                sqActual, skvActual, dActual, loadK, enAtomicDq,
+                initDk, flushDk, enAtomicDk);
         } else {
             ComputeDqDkLargeHeadDim(dsNz, k, q, dq, dk,
-                sqActual, skvActual, dActual, enAtomicDq, enAtomicDk);
+                sqActual, skvActual, dActual, loadK, enAtomicDq,
+                initDk, flushDk, enAtomicDk);
         }
     }
 
@@ -163,44 +200,48 @@ public:
         AscendC::LocalTensor<ElementA> pNz,
         TensorDy& dy, TensorDv& dv,
         GemmCoord const& actualShape,
-        bool enAtomicDv)
+        bool initDv, bool flushDv, bool enAtomicDv)
     {
         const uint32_t sqActual = actualShape.m();
         const uint32_t dvActual = actualShape.n();
         const uint32_t skvActual = actualShape.k();
         if (dvActual <= BASE) {
             ComputeDvSmallHeadDim(pNz, dy, dv,
-                sqActual, skvActual, dvActual, enAtomicDv);
+                sqActual, skvActual, dvActual, initDv, flushDv, enAtomicDv);
         } else {
             ComputeDvLargeHeadDim(pNz, dy, dv,
-                sqActual, skvActual, dvActual, enAtomicDv);
+                sqActual, skvActual, dvActual, initDv, flushDv, enAtomicDv);
         }
     }
 
 protected:
-    // dS/P are NZ tiles written from UB to L1 by the vector core. The same
-    // physical tile is used as zN for dQ and as nZ for dK/dV.
     template <class TensorK, class TensorQ, class TensorDq, class TensorDk>
     CATLASS_DEVICE
     void ComputeDqDkSmallHeadDim(
         AscendC::LocalTensor<ElementA> dsNz,
         TensorK& k, TensorQ& q, TensorDq& dq, TensorDk& dk,
         uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
-        bool enAtomicDq, bool enAtomicDk)
+        bool loadK, bool enAtomicDq,
+        bool initDk, bool flushDk, bool enAtomicDk)
     {
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dActual);
-        CopyGmToL1B(l1K, k, skvActual, dActual, skvRound, dRound, 0);
-        CopyGmToL1B(l1Q, q, sqActual, dActual, sqRound, dRound, 1);
+        if (loadK) {
+            CopyGmToL1B(l1K, k, skvActual, dActual, skvRound, dRound, L1_EVENT_K);
+        }
+        CopyGmToL1B(l1Q, q, sqActual, dActual, sqRound, dRound, L1_EVENT_Q);
         GemmRow(dsNz, l1K, l0CTensorList[SLOT_DQ],
             sqRound, dRound, skvRound, sqActual, dActual, skvActual,
-            true, 0b11, SLOT_DQ, 0);
+            true, 0b11, SLOT_DQ, L1_EVENT_K, /*waitB=*/loadK, /*releaseB=*/false);
         FixpipeTla(dq, l0CTensorList[SLOT_DQ], sqActual, dActual, sqRound, enAtomicDq, SLOT_DQ);
         GemmColA(dsNz, l1Q, l0CTensorList[SLOT_DK],
             skvRound, dRound, sqRound, skvActual, dActual, sqActual,
-            true, 0b11, SLOT_DK, 1);
-        FixpipeTla(dk, l0CTensorList[SLOT_DK], skvActual, dActual, skvRound, enAtomicDk, SLOT_DK);
+            initDk, 0b11, SLOT_DK, L1_EVENT_Q, /*waitB=*/true, /*releaseB=*/true);
+        if (flushDk) {
+            FixpipeTla(dk, l0CTensorList[SLOT_DK], skvActual, dActual, skvRound, enAtomicDk, SLOT_DK);
+            ReleaseResidentK();
+        }
     }
 
     template <class TensorDy, class TensorDv>
@@ -208,16 +249,18 @@ protected:
     void ComputeDvSmallHeadDim(
         AscendC::LocalTensor<ElementA> pNz, TensorDy& dy, TensorDv& dv,
         uint32_t sqActual, uint32_t skvActual, uint32_t dvActual,
-        bool enAtomicDv)
+        bool initDv, bool flushDv, bool enAtomicDv)
     {
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dvRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dvActual);
-        CopyGmToL1B(l1Dy, dy, sqActual, dvActual, sqRound, dvRound, 2);
+        CopyGmToL1B(l1Dy, dy, sqActual, dvActual, sqRound, dvRound, L1_EVENT_DY);
         GemmColA(pNz, l1Dy, l0CTensorList[SLOT_DV],
             skvRound, dvRound, sqRound, skvActual, dvActual, sqActual,
-            true, 0b11, SLOT_DV, 2);
-        FixpipeTla(dv, l0CTensorList[SLOT_DV], skvActual, dvActual, skvRound, enAtomicDv, SLOT_DV);
+            initDv, 0b11, SLOT_DV, L1_EVENT_DY, /*waitB=*/true, /*releaseB=*/true);
+        if (flushDv) {
+            FixpipeTla(dv, l0CTensorList[SLOT_DV], skvActual, dvActual, skvRound, enAtomicDv, SLOT_DV);
+        }
     }
 
     template <class TensorK, class TensorQ, class TensorDq, class TensorDk>
@@ -226,8 +269,14 @@ protected:
         AscendC::LocalTensor<ElementA> dsNz,
         TensorK& k, TensorQ& q, TensorDq& dq, TensorDk& dk,
         uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
-        bool enAtomicDq, bool enAtomicDk)
+        bool loadK, bool enAtomicDq,
+        bool initDk, bool flushDk, bool enAtomicDk)
     {
+        // D>BASE: each D-slice must Fixpipe and release L1 K before the next
+        // slice. Cross-s1 L0C accumulate is only safe for the single-slice
+        // (D<=BASE) path; otherwise FIX_M / MTE1_MTE2 deadlock.
+        (void)initDk;
+        (void)flushDk;
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dLoops = CeilDiv(dActual, BASE);
@@ -240,19 +289,22 @@ protected:
             auto qTile = GetTile(q, tla::MakeCoord(0u, nOff), tla::MakeShape(sqActual, nAct));
             auto dqTile = GetTile(dq, tla::MakeCoord(0u, nOff), tla::MakeShape(sqActual, nAct));
             auto dkTile = GetTile(dk, tla::MakeCoord(0u, nOff), tla::MakeShape(skvActual, nAct));
-            CopyGmToL1B(l1K, kTile, skvActual, nAct, skvRound, nRound, 0);
-            CopyGmToL1B(l1Q, qTile, sqActual, nAct, sqRound, nRound, 1);
+            CopyGmToL1B(l1K, kTile, skvActual, nAct, skvRound, nRound, L1_EVENT_K);
+            CopyGmToL1B(l1Q, qTile, sqActual, nAct, sqRound, nRound, L1_EVENT_Q);
             GemmRow(dsNz, l1K, l0CTensorList[slotDq],
                 sqRound, nRound, skvRound, sqActual, nAct, skvActual,
-                true, 0b11, slotDq, 0);
+                true, 0b11, slotDq, L1_EVENT_K, /*waitB=*/true, /*releaseB=*/true);
             FixpipeTla(dqTile, l0CTensorList[slotDq],
                 sqActual, nAct, sqRound, enAtomicDq, slotDq);
             GemmColA(dsNz, l1Q, l0CTensorList[SLOT_DK],
                 skvRound, nRound, sqRound, skvActual, nAct, sqActual,
-                true, 0b11, SLOT_DK, 1);
+                true, 0b11, SLOT_DK, L1_EVENT_Q, true, true);
+            // Always atomic: every s1 writes every D-slice into the same GM tile.
             FixpipeTla(dkTile, l0CTensorList[SLOT_DK],
-                skvActual, nAct, skvRound, enAtomicDk, SLOT_DK);
+                skvActual, nAct, skvRound, /*enAtomic=*/true, SLOT_DK);
         }
+        (void)loadK;
+        (void)enAtomicDk;
     }
 
     template <class TensorDy, class TensorDv>
@@ -260,8 +312,11 @@ protected:
     void ComputeDvLargeHeadDim(
         AscendC::LocalTensor<ElementA> pNz, TensorDy& dy, TensorDv& dv,
         uint32_t sqActual, uint32_t skvActual, uint32_t dvActual,
-        bool enAtomicDv)
+        bool initDv, bool flushDv, bool enAtomicDv)
     {
+        (void)initDv;
+        (void)flushDv;
+        (void)enAtomicDv;
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dvLoops = CeilDiv(dvActual, BASE);
@@ -271,16 +326,15 @@ protected:
             const uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(nAct);
             auto dyTile = GetTile(dy, tla::MakeCoord(0u, nOff), tla::MakeShape(sqActual, nAct));
             auto dvTile = GetTile(dv, tla::MakeCoord(0u, nOff), tla::MakeShape(skvActual, nAct));
-            CopyGmToL1B(l1Dy, dyTile, sqActual, nAct, sqRound, nRound, 2);
+            CopyGmToL1B(l1Dy, dyTile, sqActual, nAct, sqRound, nRound, L1_EVENT_DY);
             GemmColA(pNz, l1Dy, l0CTensorList[SLOT_DV],
                 skvRound, nRound, sqRound, skvActual, nAct, sqActual,
-                true, 0b11, SLOT_DV, 2);
+                true, 0b11, SLOT_DV, L1_EVENT_DY, true, true);
             FixpipeTla(dvTile, l0CTensorList[SLOT_DV],
-                skvActual, nAct, skvRound, enAtomicDv, SLOT_DV);
+                skvActual, nAct, skvRound, /*enAtomic=*/true, SLOT_DV);
         }
     }
 
-    // -------------------- TLA helpers --------------------
     template <class TensorGm>
     CATLASS_DEVICE
     void CopyGmToL1B(
@@ -307,7 +361,7 @@ protected:
         uint32_t mRound, uint32_t nRound, uint32_t kRound,
         uint32_t mActual, uint32_t nActual, uint32_t kActual,
         bool initC, uint8_t unitFlag, uint32_t l0cSlot,
-        uint32_t l1BEvent)
+        uint32_t l1BEvent, bool waitB, bool releaseB)
     {
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(mRound, kRound);
         auto layoutAInL0 = tla::MakeLayout<ElementA, LayoutTagL0A>(mRound, kRound);
@@ -328,9 +382,13 @@ protected:
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventList[l0AListId]);
 
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
+        if (waitB) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
+        }
         copyL1ToL0B(tensorL0B, tileL1B);
-        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
+        if (releaseB) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventList[l0BListId]);
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventList[l0AListId]);
@@ -356,7 +414,7 @@ protected:
         uint32_t mRound, uint32_t nRound, uint32_t kRound,
         uint32_t mActual, uint32_t nActual, uint32_t kActual,
         bool initC, uint8_t unitFlag, uint32_t l0cSlot,
-        uint32_t l1BEvent)
+        uint32_t l1BEvent, bool waitB, bool releaseB)
     {
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1ACol>(mRound, kRound);
         auto layoutAInL0 = tla::MakeLayout<ElementA, LayoutTagL0ACol>(mRound, kRound);
@@ -377,9 +435,13 @@ protected:
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventList[l0AListId]);
 
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
+        if (waitB) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
+        }
         copyL1ToL0B(tensorL0B, tileL1B);
-        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
+        if (releaseB) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventList[l0BListId]);
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventList[l0AListId]);
@@ -444,7 +506,7 @@ protected:
     int32_t l0AEventList[L0AB_STAGES];
     int32_t l0BEventList[L0AB_STAGES];
     int32_t l0CEventList[L0C_STAGES];
-    int32_t l1EventList[L1_BUFFER_COUNT];
+    int32_t l1EventList[Ascend950FagL1Layout::SLOT_COUNT];
 
     uint32_t l0AListId{0};
     uint32_t l0BListId{0};

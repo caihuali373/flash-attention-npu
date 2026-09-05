@@ -49,6 +49,25 @@ struct Ascend950FagL0CLayout {
     static constexpr uint32_t L0C_SDP_SLOT_NUM = 2;
 };
 
+// Shared cube L1 map after P/dS ping-pong (see Mm12L1Offset in fag_kernel.cpp).
+// Resident KT/VT/K survive across contiguous s1 of the same (batch,n2,s2).
+// WORK_Q / WORK_DY are overwritten every task by C1/C2/C5/C34.
+// Layout (tile = 128 x 256 x sizeof(elem), typically 64KB):
+//   [0] RES_KT  K^T for S = Q K^T
+//   [1] RES_VT  V^T for dP = dY V^T
+//   [2] RES_K   K  (RowMajor) for dQ = dS K
+//   [3] WORK_Q  Q for C1 / C34
+//   [4] WORK_DY dY for C2 / C5
+struct Ascend950FagL1Layout {
+    static constexpr uint32_t BASE = 128;
+    static constexpr uint32_t SLOT_RES_KT = 0;
+    static constexpr uint32_t SLOT_RES_VT = 1;
+    static constexpr uint32_t SLOT_RES_K = 2;
+    static constexpr uint32_t SLOT_WORK_Q = 3;
+    static constexpr uint32_t SLOT_WORK_DY = 4;
+    static constexpr uint32_t SLOT_COUNT = 5;
+};
+
 
 // Ascend950 / Arch3501 FAG dQKV
 // Computes dq=dS*K, dk=dS^T*Q, dv=P^T*dY in one block.

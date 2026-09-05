@@ -36,21 +36,23 @@ static constexpr uint16_t SYNC_C5_TO_V1_FLAG = 9;
 /*
  * FAG arch35 task pipeline and L1-buffer ownership:
  *
- *   C1: mm(Q, K^T)
+ *   C1: mm(Q, K^T)   -- K^T resident across s1 of the same (b,n2,s2)
  *       -- C1_TO_V1[taskId % 2] -->
  *   V1: scaledMaskSoftmax
- *       -- V1_TO_C5 --> C5: mm(P^T, dY)
+ *       -- V1_TO_C5 --> C5: mm(P^T, dY)  -- dV accumulates in L0C until group end
  *       <-- C5_TO_V1 -- return the P L1 buffer
  *
- *   C2: mm(dY, V^T)
+ *   C2: mm(dY, V^T)  -- V^T resident across s1 of the same (b,n2,s2)
  *       -- C2_TO_V2[taskId % 2] -->
  *   V2: dS
- *       -- V2_TO_C34 --> C3: mm(dS, K) and C4: mm(dS^T, Q)
+ *       -- V2_TO_C34 --> C3: mm(dS, K) / C4: mm(dS^T, Q)
+ *                       -- K (RowMajor) resident; dK accumulates in L0C
  *       <-- C34_TO_V2 -- return the dS L1 buffer
  *
+ * Scheduling: each AIC owns whole (batch, n2, s2Block) groups so contiguous
+ * s1 ranges never bounce across cores (keeps KV L1 residency valid).
+ *
  * In steady state, C1/C2 of task i overlap V1/V2/C5/C3/C4 of task i - 1.
- * C1/C2 completion flags use taskId % TASK_PINGPONG. P and dS L1 buffers
- * use a forward ready flag plus a reverse return flag to enforce ownership.
  */
 
 template <
@@ -121,7 +123,8 @@ public:
             : scaleValue_;
 
         // L1 layout:
-        //   [P ping][P pong][dS ping][dS pong]
+        //   [P ping][P pong][dS ping][dS pong] | cube working via Mm12L1Offset
+        //   cube: [RES_KT][RES_VT][RES_K][WORK_Q][WORK_DY]
         const uint32_t l1TileBytes =
             qBlockSize_ * kvBlockSize_ * sizeof(DataType);
         const uint32_t l1PBaseOffset = 0;
@@ -475,7 +478,6 @@ private:
         uint32_t subBlockIdx)
     {
         if (coreIdx >= coreNum_ || coreNum_ == 0 ||
-            continuousBlockNum_ == 0 ||
             qBlockSize_ == 0 || kvBlockSize_ == 0) {
             return;
         }
@@ -487,61 +489,164 @@ private:
 #ifdef __DAV_VEC__
         SetVecEvents();
 #endif
+        // Assign each (batch, n2, s2Block) group to exactly one AIC so that
+        // contiguous s1 ranges stay on the same core (KV L1 residency + local
+        // dk/dv accumulate). Round-robin over kvGroupId.
         uint64_t taskId = 0;
-        for (uint32_t issueRound = 0;; ++issueRound) {
-            const uint64_t blockBegin =
-                static_cast<uint64_t>(issueRound) * waveSize_ +
-                static_cast<uint64_t>(coreIdx) * continuousBlockNum_;
+        uint64_t kvGroupId = 0;
+        bool hasPrev = false;
+        bool ktResident = false;
+        bool vtResident = false;
 
-            for (uint32_t issueLane = 0;
-                 issueLane < continuousBlockNum_; ++issueLane) {
-                FAGBlockInfo block{};
-                if (!DecodeBlock(blockBegin + issueLane, block)) {
-                    if (taskId != 0) {
-                        // Drain the last task. There is no following task, so
-                        // its L1 buffers do not need to be returned.
-#ifdef __DAV_CUBE__
-                        ProcessC5Stage(previousBlock_, false, mm345);
-                        ProcessC34Stage(previousBlock_, false, mm345);
-#endif
-#ifdef __DAV_VEC__
-                        ProcessV1Stage(previousBlock_, subBlockIdx);
-                        ProcessV2Stage(previousBlock_, subBlockIdx);
-#endif
+        for (uint32_t batchIdx = 0; batchIdx < batchNum_; ++batchIdx) {
+            uint64_t qBatchStart = 0;
+            uint64_t kvBatchStart = 0;
+            uint32_t s1Length = 0;
+            uint32_t s2Length = 0;
+            GetBatchShape(batchIdx, qBatchStart, kvBatchStart, s1Length, s2Length);
+            const uint32_t s1BlockNum =
+                static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+            const uint32_t s2BlockNum =
+                static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
+
+            for (uint32_t n2Idx = 0; n2Idx < kvHeadNum_; ++n2Idx) {
+                for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum;
+                     ++s2BlockIdx, ++kvGroupId) {
+                    if ((kvGroupId % coreNum_) != coreIdx) {
+                        continue;
                     }
-#ifdef __DAV_CUBE__
-                    WaitCubeEvents();
-#endif
-#ifdef __DAV_VEC__
-                    WaitVecEvents();
-#endif
-                    return;
-                }
-                block.taskId = taskId;
-                block.issueRound = issueRound;
-                block.issueLane = issueLane;
+
+                    const uint32_t firstValidS1 = FirstValidS1Block(
+                        s1Length, s2Length, s2BlockIdx);
+                    if (firstValidS1 >= s1BlockNum) {
+                        continue;
+                    }
+
+                    const uint32_t validS1Num = s1BlockNum - firstValidS1;
+                    const uint32_t tasksInGroup = groupNum_ * validS1Num;
+                    if (tasksInGroup == 0) {
+                        continue;
+                    }
+
+                    uint32_t taskInGroup = 0;
+                    for (uint32_t groupIdx = 0; groupIdx < groupNum_; ++groupIdx) {
+                        for (uint32_t s1Ord = 0; s1Ord < validS1Num;
+                             ++s1Ord, ++taskInGroup) {
+                            FAGBlockInfo block{};
+                            const uint32_t s1BlockIdx = firstValidS1 + s1Ord;
+                            FillBlockInfoFrom(
+                                batchIdx, n2Idx, groupIdx, s1BlockIdx, s2BlockIdx,
+                                qBatchStart, kvBatchStart, s1Length, s2Length,
+                                block);
+                            block.taskId = taskId;
+                            block.loadKv = (taskInGroup == 0);
+                            block.initDkv = (taskInGroup == 0);
+                            block.flushDkv = (taskInGroup + 1 == tasksInGroup);
 
 #ifdef __DAV_CUBE__
-                // Front-end MM of task i overlaps the vector and back-end MM
-                // stages of task i - 1.
-                ProcessC1Stage(block, mm12);
-                ProcessC2Stage(block, mm12);
-                if (taskId != 0) {
-                    ProcessC5Stage(previousBlock_, true, mm345);
-                    ProcessC34Stage(previousBlock_, true, mm345);
-                }
+                            // New s2 group: free previous KT/VT before reload.
+                            // RES_K stays until C34 of the previous group flushes
+                            // (it lives in a different L1 slot).
+                            if (block.loadKv && ktResident) {
+                                mm12.ReleaseResidentKT();
+                                ktResident = false;
+                            }
+                            if (block.loadKv && vtResident) {
+                                mm12.ReleaseResidentVT();
+                                vtResident = false;
+                            }
+                            ProcessC1Stage(block, mm12);
+                            ProcessC2Stage(block, mm12);
+                            if (block.loadKv) {
+                                ktResident = true;
+                                vtResident = true;
+                            }
+                            if (hasPrev) {
+                                ProcessC5Stage(previousBlock_, true, mm345);
+                                ProcessC34Stage(previousBlock_, true, mm345);
+                            }
 #endif
 #ifdef __DAV_VEC__
-                if (taskId != 0) {
-                    ProcessV1Stage(previousBlock_, subBlockIdx);
-                    ProcessV2Stage(previousBlock_, subBlockIdx);
-                }
+                            if (hasPrev) {
+                                ProcessV1Stage(previousBlock_, subBlockIdx);
+                                ProcessV2Stage(previousBlock_, subBlockIdx);
+                            }
 #endif
-
-                previousBlock_ = block;
-                ++taskId;
+                            previousBlock_ = block;
+                            hasPrev = true;
+                            ++taskId;
+                        }
+                    }
+                }
             }
         }
+
+        if (hasPrev) {
+#ifdef __DAV_CUBE__
+            ProcessC5Stage(previousBlock_, false, mm345);
+            ProcessC34Stage(previousBlock_, false, mm345);
+            if (ktResident) {
+                mm12.ReleaseResidentKT();
+            }
+            if (vtResident) {
+                mm12.ReleaseResidentVT();
+            }
+#endif
+#ifdef __DAV_VEC__
+            ProcessV1Stage(previousBlock_, subBlockIdx);
+            ProcessV2Stage(previousBlock_, subBlockIdx);
+#endif
+        }
+#ifdef __DAV_CUBE__
+        WaitCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+        WaitVecEvents();
+#endif
+    }
+
+    CATLASS_DEVICE
+    void FillBlockInfoFrom(
+        uint32_t batchIdx,
+        uint32_t n2Idx,
+        uint32_t groupIdx,
+        uint32_t s1BlockIdx,
+        uint32_t s2BlockIdx,
+        uint64_t qBatchStart,
+        uint64_t kvBatchStart,
+        uint32_t s1Length,
+        uint32_t s2Length,
+        FAGBlockInfo &block)
+    {
+        const uint32_t s1Start = s1BlockIdx * qBlockSize_;
+        const uint32_t s2Start = s2BlockIdx * kvBlockSize_;
+        const uint64_t totalS1Start = qBatchStart + s1Start;
+        const uint64_t totalS2Start = kvBatchStart + s2Start;
+        const uint64_t qHeadIdx =
+            static_cast<uint64_t>(n2Idx) * groupNum_ + groupIdx;
+
+        block.batchIdx = batchIdx;
+        block.n2Idx = n2Idx;
+        block.groupIdx = groupIdx;
+        block.s1BlockIdx = s1BlockIdx;
+        block.s2BlockIdx = s2BlockIdx;
+        block.s1Start = s1Start;
+        block.s2Start = s2Start;
+        block.curBatchS1 = s1Length;
+        block.curBatchS2 = s2Length;
+        block.s1Extend = Min(qBlockSize_, s1Length - s1Start);
+        block.s2Extend = Min(kvBlockSize_, s2Length - s2Start);
+        block.totalS1Start = totalS1Start;
+        block.totalS2Start = totalS2Start;
+        block.qOffset =
+            (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
+        block.kOffset =
+            (totalS2Start * kvHeadNum_ + n2Idx) * qkHeadDim_;
+        block.vOffset =
+            (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
+        block.doutOffset =
+            (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
+        block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
     }
 
 #ifdef __DAV_CUBE__
@@ -553,8 +658,10 @@ private:
         for (uint32_t eventId = 0; eventId < 4; ++eventId) {
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventId);
         }
-        // mm12 and mm345 share the four physical L1-buffer tokens.
-        for (uint32_t eventId = 0; eventId < 4; ++eventId) {
+        // mm12 and mm345 share Ascend950FagL1Layout::SLOT_COUNT L1 tokens.
+        for (uint32_t eventId = 0;
+             eventId < Catlass::Gemm::Ascend950FagL1Layout::SLOT_COUNT;
+             ++eventId) {
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
         }
         // One availability token for every physical 64-KB L0C slot.
@@ -571,7 +678,9 @@ private:
         for (uint32_t eventId = 0; eventId < 4; ++eventId) {
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventId);
         }
-        for (uint32_t eventId = 0; eventId < 4; ++eventId) {
+        for (uint32_t eventId = 0;
+             eventId < Catlass::Gemm::Ascend950FagL1Layout::SLOT_COUNT;
+             ++eventId) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
         }
         for (uint32_t eventId = 0;
@@ -595,8 +704,8 @@ private:
             tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
         auto s = tla::MakeTensor(
             ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
-        mm12(q, k, s, Catlass::GemmCoord(
-            block.s1Extend, block.s2Extend, qkHeadDim_));
+        mm12.ComputeS(q, k, s, Catlass::GemmCoord(
+            block.s1Extend, block.s2Extend, qkHeadDim_), block.loadKv);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
@@ -616,8 +725,8 @@ private:
             tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
         auto dp = tla::MakeTensor(
             ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
-        mm12(dy, v, dp, Catlass::GemmCoord(
-            block.s1Extend, block.s2Extend, vHeadDim_));
+        mm12.ComputeDP(dy, v, dp, Catlass::GemmCoord(
+            block.s1Extend, block.s2Extend, vHeadDim_), block.loadKv);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
@@ -640,9 +749,11 @@ private:
         auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
             block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
 
+        // Single AIC owns the (b,n2,s2) group → no GM atomic on dv; accumulate
+        // in L0C and fixpipe once on flushDkv.
         mm345.ComputeDv(l1PTensor[slot], dy, dv,
             Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-            true);
+            block.initDkv, block.flushDkv, /*enAtomicDv=*/false);
 
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
@@ -673,10 +784,14 @@ private:
         auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
             block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
 
+        // dq still atomics across s2 blocks (same q rows); dk accumulates in
+        // L0C within the s2 group and writes once without atomic.
         mm345.ComputeDqDk(
             l1dSTensor[slot], k, q, dq, dk,
             Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-            true, true);
+            /*loadK=*/block.initDkv,
+            /*enAtomicDq=*/true,
+            block.initDkv, block.flushDkv, /*enAtomicDk=*/false);
 
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
@@ -700,6 +815,8 @@ private:
     CATLASS_DEVICE
     uint32_t Mm12L1Offset() const
     {
+        // P/dS ping-pong occupies the front of L1; cube working tiles
+        // (RES_KT/VT/K + WORK_Q/DY) start after that.
         return 2U * TASK_PINGPONG * qBlockSize_ * kvBlockSize_ * sizeof(DataType);
     }
 #endif
