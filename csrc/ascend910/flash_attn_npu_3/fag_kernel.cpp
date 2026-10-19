@@ -157,8 +157,10 @@ public:
         hasSeqUsedQ = params.seqUsedQ != nullptr;
         hasSeqUsedKv = params.seqUsedKv != nullptr;
 
-        // From tiling: cu[b - 1] would undercount after used-length tail trimming.
-        int64_t sfmgOutputSize = static_cast<int64_t>(fagTilingData->sfmgNormalAxisSize) * 8;
+        int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
+        if constexpr (INPUT_LAYOUT == TND) {
+            sfmgOutputSize = ((__gm__ int32_t*)params.cu_seq_qlen)[b - 1] * n2 * g * 8;
+        }
 
         dqWorkSpaceGm.SetGlobalBuffer((__gm__ float *)params.workspace +
                                     fagTilingData->dqWorkSpaceOffset / sizeof(float));
@@ -203,7 +205,20 @@ public:
                                 ADDR_ALIGN_SIZE - 1) / ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
     
             dvDtmWsGm.SetGlobalBuffer((__gm__ float *)(params.workspace + workspaceOffsets));
-        }                                                    
+        }
+
+        // Single KV tile + single valid causal S1 + GQA: schedule g outermost so
+        // g=0/g=1 never share a wave; each cube writes final WS (g0 plain, g>0 atomic)
+        // and skips SyncAll+DtmAdd. Keeps the normal MM1/Vec/Dqkv pipeline.
+        useGqaAtomicPath_ = false;
+        if constexpr (IS_DTM == ENABLE && INPUT_LAYOUT == BSND) {
+            if (s2Outer == 1 && g > 1) {
+                const int64_t s1IdxUp = -actualCalcS2Token;
+                const int64_t s1oIdxUp = s1IdxUp > 0 ? (s1IdxUp / static_cast<int64_t>(s1CvInner)) : 0;
+                const int64_t validS1Tiles = s1Outer - s1oIdxUp;
+                useGqaAtomicPath_ = (validS1Tiles == 1) && (s1oIdxUp >= 0) && (s1oIdxUp < s1Outer);
+            }
+        }
     }
 
     __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t &actualSeqQlen, int32_t &actualSeqKvlen)
@@ -227,11 +242,46 @@ public:
         return;
     }
 
+    __aicore__ inline void UpdateToken(int64_t bIdx)
+    {
+        if constexpr (IS_ATTEN_MASK != ENABLE) {
+            return;
+        }
+        int32_t actualS1Len = 0;
+        int32_t actualS2Len = 0;
+        GetSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
+        actualCalcS1Token = s1Token + actualS1Len - actualS2Len;
+        actualCalcS2Token = s2Token - actualS1Len + actualS2Len;
+    }
+
     __aicore__ inline void UpdateIndex()
     {
         s1oDimIdx = 0;
         if constexpr (IS_DTM == ENABLE) {
-            if (gDimIdx < g - 1) {
+            if (useGqaAtomicPath_) {
+                // g-outer: all (b,n2) for g=0, then g=1, ... — no same-wave GQA merge.
+                if (s2oCvDimIdx < s2Outer - 1) {
+                    s2oCvDimIdx++;
+                } else if (n2DimIdx < n2 - 1) {
+                    s2oCvDimIdx = 0;
+                    n2DimIdx++;
+                } else if (bDimIdx < b - 1) {
+                    s2oCvDimIdx = 0;
+                    n2DimIdx = 0;
+                    bDimIdx++;
+                    dqOutBase += n2 * g * s1Outer;
+                    kvOutBase += n2 * s2Outer;
+                } else if (gDimIdx < g - 1) {
+                    gDimIdx++;
+                    bDimIdx = 0;
+                    n2DimIdx = 0;
+                    s2oCvDimIdx = 0;
+                    dqOutBase = 0;
+                    kvOutBase = 0;
+                } else {
+                    bDimIdx = b;
+                }
+            } else if (gDimIdx < g - 1) {
                 gDimIdx++;
             } else if (s2oCvDimIdx < s2Outer - 1) {
                 gDimIdx = 0;
@@ -351,41 +401,72 @@ public:
 
         // -----确定性计算，计算kvGroupId和dqGroupId
         if constexpr (IS_DTM == ENABLE) {
-            int8_t kvGroupId = startCoreId;
-            if (startCoreId > 0 && kvOutIdx == kvOutArr[startCoreId - 1] && dbParam.kvGroupId[startCoreId - 1] != OUTIDX) {
-                kvGroupId = dbParam.kvGroupId[startCoreId - 1];
-            }
             uint32_t s2CvExtend = (s2oCvDimIdx == s2Outer - 1) ? s2CvTail : s2CvInner;
 
-            for (int32_t i = startCoreId; i < cubeCoreNum; i++) {
-                if (i - startCoreId >= validNum) {
-                    break;
-                }
-                dqOutArr[i] = dqOutIdx + i - startCoreId;
-                kvOutArr[i] = kvOutIdx;
-                dbParam.blockIdArr[i] = baseIdx + i - startCoreId;
-                dbParam.s1CvExtendArr[i] = (s1oDimIdx + i - startCoreId) == (s1Outer - 1) ? s1CvTail : s1CvInner;
-                int64_t s2RightIdx = (s1oDimIdx + i - startCoreId) * s1CvInner + dbParam.s1CvExtendArr[i] + actualCalcS2Token;
-                s2RightIdx = s2RightIdx > 0 ? s2RightIdx : 0;
-                s2RightIdx = (s2RightIdx + 7) / 8 * 8;
-                dbParam.s2CvExtendArr[i] = s2RightIdx > (s2oCvDimIdx * s2CvInner + s2CvExtend) ?
-                                        s2CvExtend : (s2RightIdx - s2oCvDimIdx * s2CvInner);
-                dbParam.kvGroupId[i] = kvGroupId;
-                dbParam.dqGroupId[i] = i;
-                if (s2oCvDimIdx == 0) {
-                    dbParam.dqGroupId[i] = OUTIDX;
-                    continue;
-                }
-
-                for (int32_t j = 0; j < startCoreId; j++) {
-                    if (dqOutArr[i] == dqOutArr[j]) {
-                        dbParam.dqGroupId[i] = j;
+            if (useGqaAtomicPath_) {
+                // Unique (b,n2) per wave under g-outer; always write final WS.
+                // gIdx>0 uses Fixpipe atomic in DTMComputeMMDqkv — no DtmAdd.
+                for (int32_t i = startCoreId; i < cubeCoreNum; i++) {
+                    if (i - startCoreId >= validNum) {
                         break;
                     }
+                    dqOutArr[i] = dqOutIdx + i - startCoreId;
+                    kvOutArr[i] = kvOutIdx;
+                    dbParam.blockIdArr[i] = baseIdx + i - startCoreId;
+                    dbParam.s1CvExtendArr[i] =
+                        (s1oDimIdx + i - startCoreId) == (s1Outer - 1) ? s1CvTail : s1CvInner;
+                    int64_t s2RightIdx = (s1oDimIdx + i - startCoreId) * s1CvInner +
+                                        dbParam.s1CvExtendArr[i] + actualCalcS2Token;
+                    s2RightIdx = s2RightIdx > 0 ? s2RightIdx : 0;
+                    s2RightIdx = (s2RightIdx + 7) / 8 * 8;
+                    dbParam.s2CvExtendArr[i] =
+                        s2RightIdx > (s2oCvDimIdx * s2CvInner + s2CvExtend)
+                            ? s2CvExtend
+                            : (s2RightIdx - s2oCvDimIdx * s2CvInner);
+                    dbParam.dqGroupId[i] = OUTIDX;
+                    dbParam.kvGroupId[i] = OUTIDX;
                 }
-            }
-            if (s1oDimIdx == s1oIdxUp && gDimIdx == 0) {
-                dbParam.kvGroupId[startCoreId] = OUTIDX;
+            } else {
+                int8_t kvGroupId = startCoreId;
+                if (startCoreId > 0 && kvOutIdx == kvOutArr[startCoreId - 1] &&
+                    dbParam.kvGroupId[startCoreId - 1] != OUTIDX) {
+                    kvGroupId = dbParam.kvGroupId[startCoreId - 1];
+                }
+
+                for (int32_t i = startCoreId; i < cubeCoreNum; i++) {
+                    if (i - startCoreId >= validNum) {
+                        break;
+                    }
+                    dqOutArr[i] = dqOutIdx + i - startCoreId;
+                    kvOutArr[i] = kvOutIdx;
+                    dbParam.blockIdArr[i] = baseIdx + i - startCoreId;
+                    dbParam.s1CvExtendArr[i] =
+                        (s1oDimIdx + i - startCoreId) == (s1Outer - 1) ? s1CvTail : s1CvInner;
+                    int64_t s2RightIdx = (s1oDimIdx + i - startCoreId) * s1CvInner +
+                                        dbParam.s1CvExtendArr[i] + actualCalcS2Token;
+                    s2RightIdx = s2RightIdx > 0 ? s2RightIdx : 0;
+                    s2RightIdx = (s2RightIdx + 7) / 8 * 8;
+                    dbParam.s2CvExtendArr[i] =
+                        s2RightIdx > (s2oCvDimIdx * s2CvInner + s2CvExtend)
+                            ? s2CvExtend
+                            : (s2RightIdx - s2oCvDimIdx * s2CvInner);
+                    dbParam.kvGroupId[i] = kvGroupId;
+                    dbParam.dqGroupId[i] = i;
+                    if (s2oCvDimIdx == 0) {
+                        dbParam.dqGroupId[i] = OUTIDX;
+                        continue;
+                    }
+
+                    for (int32_t j = 0; j < startCoreId; j++) {
+                        if (dqOutArr[i] == dqOutArr[j]) {
+                            dbParam.dqGroupId[i] = j;
+                            break;
+                        }
+                    }
+                }
+                if (s1oDimIdx == s1oIdxUp && gDimIdx == 0) {
+                    dbParam.kvGroupId[startCoreId] = OUTIDX;
+                }
             }
         }
         //-----------
@@ -415,7 +496,7 @@ public:
         dbParam.s2Stride = 0;
 
         if constexpr (INPUT_LAYOUT == TND) {
-            // Lengths from the batch-once cache; offsets read per task like the forward.
+            // Lengths from the batch-once cache; offsets read per task from cu arrays.
             dbParam.actualS1Len = cachedActualSeqQlen;
             dbParam.actualS2Len = cachedActualSeqKvlen;
             dbParam.aTensorOffsetCv = 0;
@@ -457,8 +538,8 @@ public:
                     actualBlockShape1);
         }
 
-        // fixpipe GM write done before reusing L1 for q*k
-        AscendC::PipeBarrier<PIPE_MTE3>();
+        // BlockMmad::WaitFlag already waits FIX_M (Fixpipe done) before return;
+        // no PipeBarrier needed before reusing L1 for q*k.
 
         // mm-qk
         GemmCoord actualBlockShape(dbParam.s1CvExtend, dbParam.s2CvExtend, d);
@@ -493,42 +574,15 @@ public:
         int64_t s2_size = dbParam.s2CvExtendAlign * DTYPE_FACTOR;
         int64_t dvOutMStride = dbParam.actualS2Len;
 
-        // mm4 切分s1
-        constexpr int32_t s1SliceSize = S_SPLITT_SIZE;
-        int32_t s1SliceNum = (dbParam.s1CvExtend + s1SliceSize - 1) / s1SliceSize;
-        int32_t s1SliceTail = dbParam.s1CvExtend - (s1SliceNum - 1) * s1SliceSize;
+        // Unique-writer → skip Atomic Fixpipe (Pre InitOutput zeros required):
+        //   dq: one s2 tile when actualS2Len <= s2CvInner
+        //   dk/dv: one s1 tile and no GQA (g==1)
+        const bool enAtomicDq = (dbParam.actualS2Len > static_cast<int64_t>(s2CvInner));
+        const bool enAtomicDkv =
+            (dbParam.actualS1Len > static_cast<int64_t>(s1CvInner)) || (g > 1);
 
-        // mm3 切分s2
-        constexpr int32_t s2SliceSize = S_SPLITT_SIZE;
-        int32_t s2SliceNum = (dbParam.s2CvExtend + s2SliceSize - 1) / s2SliceSize;
-        int32_t s2SliceTail = dbParam.s2CvExtend - (s2SliceNum - 1) * s2SliceSize;
+        EnsureMmadDqkv();
 
-        // m是s1方向的循环
-        uint32_t mSplitSize = MMAD_BASE_SIZE;
-        uint32_t mLoops = (dbParam.s1CvExtend + mSplitSize - 1) / mSplitSize;
-        uint32_t mTail = dbParam.s1CvExtend - (mLoops - 1) * mSplitSize;
-        uint32_t subMSizeAct = mSplitSize;
-        uint32_t subMSizeActAlign = CeilDiv(subMSizeAct, C0_SIZE) * C0_SIZE;
-
-        // n 是s2方向的循环
-        uint32_t nSplitSize = MMAD_BASE_SIZE;
-        uint32_t nLoops = (dbParam.s2CvExtend + nSplitSize - 1) / nSplitSize;
-        uint32_t nTail = dbParam.s2CvExtend - (nLoops - 1) * nSplitSize;
-        uint32_t subNSizeAct = nSplitSize;
-        uint32_t subNSizeActAlign = CeilDiv(subNSizeAct, C0_SIZE) * C0_SIZE;
-
-        // d方向循环
-        uint32_t dSplitSize = MMAD_BASE_SIZE;
-        uint32_t dLoops = (d + dSplitSize - 1) / dSplitSize;
-        uint32_t dTail = d - (dLoops - 1) * dSplitSize;
-        uint32_t subDSizeAct = dSplitSize;
-        uint32_t subDSizeActAlign = CeilDiv(subDSizeAct, C0_SIZE) * C0_SIZE;
-
-        // value_d方向循环
-        uint32_t valueDLoops = (value_d + dSplitSize - 1) / dSplitSize;
-        uint32_t valueDTail = value_d - (valueDLoops - 1) * dSplitSize;
-        uint32_t gmBaseBlockOffset = 0;
-        
         // ///////////////////////////////////////////////////////////////
         // // Matmal4 dq
         // ///////////////////////////////////////////////////////////////
@@ -536,32 +590,26 @@ public:
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, d, dbParam.s2CvExtend);
         LayoutA2 layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), s2_size}; // RowMajor  shape=(s1,s2)  stride=s2
         LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), dbParam.s2Stride};
-        LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc}; 
-        {
-            BlockMmad2 blockMmad2(resource);
-            blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    keyGm[dbParam.bTensorOffsetCv],
-                    dqWorkSpaceGm[dqOffset],
-                    layoutA1, layoutB1, layoutC1,
-                    actualBlockShape1, true);
-        }
+        LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc};
+        blockMmad2Obj(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                keyGm[dbParam.bTensorOffsetCv],
+                dqWorkSpaceGm[dqOffset],
+                layoutA1, layoutB1, layoutC1,
+                actualBlockShape1, enAtomicDq);
 
-        // dq GM write done; blockMmad3 reuses same L1
-        AscendC::PipeBarrier<PIPE_MTE3>();
+        // BlockMmadFAG::WaitFlag waits FIX_M before return; L1/L0 reuse is safe
+        // without an extra PipeBarrier between dq / dk / dv.
 
-        BlockMmad3 blockMmad3(resource, 0, 4);
         // ///////////////////////////////////////////////////////////////
         // // left [B, N2, G, S1, S2] right [B, N2, 1, S1, D] output [B, N2, G, S2, D]
         GemmCoord actualBlockShape2(dbParam.s2CvExtend, d, dbParam.s1CvExtend);
         LayoutA3 layoutA2{actualBlockShape2.m(), actualBlockShape2.k(), s2_size}; // ColumnMajor  origin shape=(s2,s1), so stride=s2
         LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), dbParam.s1Stride};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
-        blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+        blockMmad3Obj(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
                 queryGm[dbParam.aTensorOffsetCv],
                 dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2,
-                actualBlockShape2, true);
-
-        AscendC::PipeBarrier<PIPE_MTE3>();
+                actualBlockShape2, enAtomicDkv);
 
         // ///////////////////////////////////////////////////////////////
         // // Matmal5 dv
@@ -571,15 +619,26 @@ public:
         LayoutA3 layoutA3{actualBlockShape3.m(), actualBlockShape3.k(), s2_size};
         LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), dbParam.s1Stride / d * value_d};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
-        blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+        blockMmad3Obj(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
                 dxGm[dbParam.aTensorOffsetCv / d * value_d],
                 dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3,
-                actualBlockShape3, true);
+                actualBlockShape3, enAtomicDkv);
+    }
+
+    __aicore__ inline void EnsureMmadDqkv()
+    {
+        if (mmadDqkvReady_) {
+            return;
+        }
+        blockMmad2Obj.Reset(resource);
+        blockMmad3Obj.Reset(resource, 0, 4);
+        mmadDqkvReady_ = true;
     }
 
 
     __aicore__ inline void DTMComputeMMDqkv(DBParams& dbParam, int64_t nextBlockId)
     {
+        EnsureMmadDqkv();
         pingpongIdx = dbParam.taskId % 2;
         int64_t dqOffset = 0;
         int64_t dqRopeOffset = 0;
@@ -614,6 +673,11 @@ public:
         int64_t s1_size = dbParam.actualS1Len;
         int64_t s2_size = dbParam.s2CvExtendAlign * DTYPE_FACTOR;
 
+        // g-outer atomic path: g=0 plain write (zeros from Pre), g>0 atomic add into final.
+        const bool enAtomicDkv =
+            useGqaAtomicPath_ && (dbParam.gIdx > 0) &&
+            (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX);
+
         ///////////////////////////////////////////////////////////////
         // Matmal4 dq
         ///////////////////////////////////////////////////////////////
@@ -622,27 +686,21 @@ public:
         LayoutA2 layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), s2_size};
         LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), dbParam.s2Stride};
         LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc};
-        {
-            BlockMmad2 blockMmad2(resource);
-            if (dbParam.dqGroupId[cCubeBlockIdx] == OUTIDX) {
-                blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                        keyGm[dbParam.bTensorOffsetCv],
-                        dqWorkSpaceGm[dqOffset],
-                        layoutA1, layoutB1, layoutC1,
-                        actualBlockShape1, false);
-            } else {
-                blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                        keyGm[dbParam.bTensorOffsetCv],
-                        dqDtmWsGm[dqOffset],
-                        layoutA1, layoutB1, layoutC1,
-                        actualBlockShape1, false);
-            }
+        if (dbParam.dqGroupId[cCubeBlockIdx] == OUTIDX) {
+            blockMmad2Obj(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                    keyGm[dbParam.bTensorOffsetCv],
+                    dqWorkSpaceGm[dqOffset],
+                    layoutA1, layoutB1, layoutC1,
+                    actualBlockShape1, false);
+        } else {
+            blockMmad2Obj(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                    keyGm[dbParam.bTensorOffsetCv],
+                    dqDtmWsGm[dqOffset],
+                    layoutA1, layoutB1, layoutC1,
+                    actualBlockShape1, false);
         }
 
-        // dq GM write done; blockMmad3 reuses same L1
-        AscendC::PipeBarrier<PIPE_MTE3>();
-
-        BlockMmad3 blockMmad3(resource, 0, 4);
+        // BlockMmad::WaitFlag already waits FIX_M; skip PipeBarrier before L1 reuse.
 
         ///////////////////////////////////////////////////////////////
         // Matmal4 dk
@@ -653,18 +711,16 @@ public:
         LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), dbParam.s1Stride};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
         if (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX) {
-            blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+            blockMmad3Obj(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
                     queryGm[dbParam.aTensorOffsetCv],
                     dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2,
-                    actualBlockShape2, false);
+                    actualBlockShape2, enAtomicDkv);
         } else {
-            blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+            blockMmad3Obj(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
                     queryGm[dbParam.aTensorOffsetCv],
                     dkDtmWsGm[dkvOffset], layoutA2, layoutB2, layoutC2,
                     actualBlockShape2, false);
         }
-
-        AscendC::PipeBarrier<PIPE_MTE3>();
 
         ///////////////////////////////////////////////////////////////
         // Matmal5 dv
@@ -675,12 +731,12 @@ public:
         LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), dbParam.s1Stride / d * value_d};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
         if (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX) {
-            blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+            blockMmad3Obj(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
                     dxGm[dbParam.aTensorOffsetCv / d * value_d],
                     dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3,
-                    actualBlockShape3, false);
+                    actualBlockShape3, enAtomicDkv);
         } else {
-            blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+            blockMmad3Obj(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
                     dxGm[dbParam.aTensorOffsetCv / d * value_d],
                     dvDtmWsGm[dvOffset], layoutA3, layoutB3, layoutC3,
                     actualBlockShape3, false);
@@ -749,15 +805,15 @@ public:
             // -----确定性计算-----
             if constexpr (IS_DTM == ENABLE) {
                 if (taskId > 0 && dbParams[(taskId - 1) % 3].blockId != -1) {
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(static_cast<int32_t>(eventIdMte1ToMte2));
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(static_cast<int32_t>(eventIdMte1ToMte2));
+                    // Non-DTM path has no MTE1_MTE2 drain here; BlockMmad WaitFlag
+                    // already orders FIX/MTE. The extra drain was a large bubble source.
                     CrossCoreWaitFlag(SYNC_V1_C2_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
                     DTMComputeMMDqkv(dbParams[(taskId - 1) % 3], dbParams[(taskId) % 3].blockId);
                     CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_C2_V1_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
                 }
-                if (taskId > 1) {
-                    SyncAll();
-                }
+                // Per-iter SyncAll removed: vector-side SyncAll before DtmAdd already
+                // gathers all cores. Cube pingpong is ordered by CrossCore flags +
+                // the final SyncAll after the loop.
             }
 
             taskId++;
@@ -843,9 +899,27 @@ public:
                     CrossCoreWaitFlag(SYNC_C2_V1_FLAG[dbParams[(taskId - 2) % 3].taskId % 2]);
                 }
                 if (taskId > 1) {
-                    SyncAll();
-                    epilogueFAGDtmAdd(dbParams[(taskId - 2) % 3], dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm, dqDtmWsGm, dkDtmWsGm, dvDtmWsGm);
-                    SyncAll();
+                    // All AIV cores see the same blockIdArr/groupIds (filled in CalcValidBlock).
+                    // Skip SyncAll+DtmAdd when the wave is empty or every active cube already
+                    // wrote through to the final workspace (OUTIDX) — no multi-core merge.
+                    bool anyValid = false;
+                    bool needMerge = false;
+                    for (uint32_t i = 0; i < cubeCoreNum; i++) {
+                        if (dbParams[(taskId - 2) % 3].blockIdArr[i] == -1) {
+                            break;
+                        }
+                        anyValid = true;
+                        if (dbParams[(taskId - 2) % 3].dqGroupId[i] != OUTIDX ||
+                            dbParams[(taskId - 2) % 3].kvGroupId[i] != OUTIDX) {
+                            needMerge = true;
+                            break;
+                        }
+                    }
+                    if (anyValid && needMerge) {
+                        SyncAll();
+                        epilogueFAGDtmAdd(dbParams[(taskId - 2) % 3], dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm, dqDtmWsGm, dkDtmWsGm, dvDtmWsGm);
+                        SyncAll();
+                    }
                 }
             }
             taskId++;
@@ -865,6 +939,9 @@ public:
 
 private:
     Arch::Resource<ArchTag> resource;
+    BlockMmad2 blockMmad2Obj;
+    BlockMmad3 blockMmad3Obj;
+    bool mmadDqkvReady_{false};
     constexpr static uint64_t SYNC_MODE2 = 2;
     static constexpr uint64_t SYNC_V1_C2_FLAG[3] = {4, 5, 6};
     static constexpr uint64_t SYNC_C1_V1_FLAG[3] = {1, 2, 3};
@@ -877,11 +954,6 @@ private:
     int64_t gDimIdx{0};
     int64_t s1oDimIdx{0};
     int64_t s2oCvDimIdx{0};
-
-    // Batch-once per-batch cache; safe in MM1 because it runs before the next walk.
-    uint32_t cachedBatch = 0xFFFFFFFFU;
-    int32_t cachedActualSeqQlen = 0;
-    int32_t cachedActualSeqKvlen = 0;
 
     // split info
     int64_t s1Outer;
@@ -923,6 +995,10 @@ private:
     int64_t actualCalcS2Token;
 
     uint32_t pingpongIdx = 1;
+    bool useGqaAtomicPath_{false};
+    uint32_t cachedBatch = 0xFFFFFFFFU;
+    int32_t cachedActualSeqQlen = 0;
+    int32_t cachedActualSeqKvlen = 0;
 
     uint32_t cubeBaseMN;
 };

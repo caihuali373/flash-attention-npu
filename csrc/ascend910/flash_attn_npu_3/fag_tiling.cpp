@@ -48,24 +48,109 @@ float CalculateMaskRatio(FAGTilingData &fagTilingData)
     }
 }
 
+// Re-check deterministic UB budget after changing cvInner.
+static void ClampCvInnerForDeterministicUb(FAGTilingData &fagTilingData)
+{
+    if (!fagTilingData.isDeterministic) {
+        return;
+    }
+    int64_t vecBlockNum = fagTilingData.coreNum / VEC_SPLIT_NUM;
+    int64_t s1CalcInner = (fagTilingData.s1CvInner + vecBlockNum - 1) / vecBlockNum;
+    int64_t s2CalcInner = (fagTilingData.s2CvInner + vecBlockNum - 1) / vecBlockNum;
+    int64_t dAlign = (fagTilingData.qkHeadDim + INPUT_ALIGN - 1) / INPUT_ALIGN * INPUT_ALIGN;
+    if (s1CalcInner * dAlign * sizeof(float) * DB_NUM > TOTAL_SIZE ||
+        s2CalcInner * dAlign * sizeof(float) * DB_NUM > TOTAL_SIZE) {
+        fagTilingData.s1CvInner = SAMEAB_S1_256;
+        fagTilingData.s2CvInner = SAMEAB_S1_256;
+    }
+}
+
 void AdjustCvInner(FAGTilingData &fagTilingData)
 {
     if (fagTilingData.isDeterministic) {
-        int64_t vecBlockNum = fagTilingData.coreNum / VEC_SPLIT_NUM;
-        int64_t s1CalcInner = (fagTilingData.s1CvInner + vecBlockNum - 1) / vecBlockNum;
-        int64_t s2CalcInner = (fagTilingData.s2CvInner + vecBlockNum - 1) / vecBlockNum;
-        int64_t dAlign = (fagTilingData.qkHeadDim + INPUT_ALIGN - 1) / INPUT_ALIGN * INPUT_ALIGN;
-        if (s1CalcInner * dAlign * sizeof(float) * DB_NUM > TOTAL_SIZE ||
-            s2CalcInner * dAlign * sizeof(float) * DB_NUM > TOTAL_SIZE) {
-            fagTilingData.s1CvInner = SAMEAB_S1_256;
-            fagTilingData.s2CvInner = SAMEAB_S1_256;
-        }
+        ClampCvInnerForDeterministicUb(fagTilingData);
         if (fagTilingData.qSeqlen <= fagTilingData.s1CvInner && fagTilingData.kvSeqlen <= fagTilingData.s2CvInner && fagTilingData.g == 1) {
             // s小于基本块大小时，可以走回非确定性模板
             fagTilingData.isDeterministic = false;
         }
+        // Fall through: det path previously skipped short-seq / causal tiling, which
+        // left huge head-waste on the first valid S1 tile when S1 >> S2 (e.g. case_057).
+    }
+
+    // Causal + short KV (S2 < base tile) + S1 > S2: first valid S1 row sits mid-tile
+    // (s1IdxUp = S1-S2). Grid-aligned tiles waste (s1IdxUp % s1) MAC rows on that head.
+    // Search s1 in [16,512] to minimize (tile_count, head_waste, s1): fewer tiles first
+    // (S1=64 cut waste but added waves → worse wall), then less MAC pad, then smaller
+    // buffers. Fit S2 to the short KV. Skip when S2 is long (e.g. case_213).
+    if (fagTilingData.isSparse &&
+        fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_CAUSUAL) &&
+        fagTilingData.qSeqlen > fagTilingData.kvSeqlen &&
+        fagTilingData.kvSeqlen < static_cast<int64_t>(SAMEAB_S2_BASE)) {
+        constexpr uint32_t step = 16;
+        constexpr uint32_t maxBaseBlockSize = SAMEAB_S1_BASE * SAMEAB_S2_BASE;
+        uint32_t s2Fit = static_cast<uint32_t>((fagTilingData.kvSeqlen + step - 1) / step * step);
+        s2Fit = s2Fit < step ? step : s2Fit;
+        s2Fit = s2Fit > SAMEAB_S2_BASE ? SAMEAB_S2_BASE : s2Fit;
+
+        const int64_t s1IdxUp = fagTilingData.qSeqlen - fagTilingData.kvSeqlen;
+        uint32_t bestS1 = SAMEAB_S1_256;
+        uint32_t bestTiles = UINT32_MAX;
+        uint32_t bestWaste = UINT32_MAX;
+        const int64_t vecBlockNum =
+            fagTilingData.coreNum / VEC_SPLIT_NUM > 0 ? fagTilingData.coreNum / VEC_SPLIT_NUM : 1;
+        const int64_t dAlign =
+            (fagTilingData.qkHeadDim + INPUT_ALIGN - 1) / INPUT_ALIGN * INPUT_ALIGN;
+
+        for (uint32_t s1 = step; s1 <= SAMEAB_S1_BASE; s1 += step) {
+            if (static_cast<uint64_t>(s1) * static_cast<uint64_t>(s2Fit) > maxBaseBlockSize) {
+                continue;
+            }
+            // Skip sizes deterministic UB clamp would reject (same budget as ClampCvInner).
+            if (fagTilingData.isDeterministic) {
+                const int64_t s1CalcInner = (static_cast<int64_t>(s1) + vecBlockNum - 1) / vecBlockNum;
+                const int64_t s2CalcInner = (static_cast<int64_t>(s2Fit) + vecBlockNum - 1) / vecBlockNum;
+                if (s1CalcInner * dAlign * static_cast<int64_t>(sizeof(float)) * DB_NUM > TOTAL_SIZE ||
+                    s2CalcInner * dAlign * static_cast<int64_t>(sizeof(float)) * DB_NUM > TOTAL_SIZE) {
+                    continue;
+                }
+            }
+            const uint32_t waste = static_cast<uint32_t>(s1IdxUp % static_cast<int64_t>(s1));
+            const int64_t start = s1IdxUp - static_cast<int64_t>(waste);
+            const uint32_t tiles = static_cast<uint32_t>(
+                (fagTilingData.qSeqlen - start + static_cast<int64_t>(s1) - 1) / static_cast<int64_t>(s1));
+            if (tiles < bestTiles ||
+                (tiles == bestTiles && waste < bestWaste) ||
+                (tiles == bestTiles && waste == bestWaste && s1 < bestS1)) {
+                bestTiles = tiles;
+                bestWaste = waste;
+                bestS1 = s1;
+            }
+        }
+
+        fagTilingData.s1CvInner = bestS1;
+        fagTilingData.s2CvInner = s2Fit;
+        ClampCvInnerForDeterministicUb(fagTilingData);
+        // Clamp may force 256x256; keep short-KV s2 when still within the base limit.
+        if (fagTilingData.s2CvInner > s2Fit) {
+            fagTilingData.s2CvInner = s2Fit;
+        }
         return;
     }
+
+    if (fagTilingData.isDeterministic) {
+        return;
+    }
+
+    // d=128 short-seq: only shrink to 256 when the whole seq fits one tile.
+    // Crossing 256 (e.g. max_s≈279) doubles tiles + turns Atomic back on → large regress.
+    if (fagTilingData.qkHeadDim == 128 &&
+        fagTilingData.qSeqlen <= SAMEAB_S1_256 &&
+        fagTilingData.kvSeqlen <= SAMEAB_S1_256) {
+        fagTilingData.s1CvInner = SAMEAB_S1_256;
+        fagTilingData.s2CvInner = SAMEAB_S1_256;
+        return;
+    }
+
     // calculate best cvInner
     if (fagTilingData.isSparse == false && fagTilingData.kvSeqlen < 4 * SAMEAB_S1_BASE) {
         if (fagTilingData.qkHeadDim == 64 && fagTilingData.qSeqlen >= fagTilingData.s1CvInner && fagTilingData.kvSeqlen >= fagTilingData.s2CvInner) {

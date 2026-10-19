@@ -123,45 +123,75 @@ public:
     static_assert(L0C_TILE_SIZE <= L0C_SIZE, "L0TileShape exceeding the L0C space!");
     
     CATLASS_DEVICE
-    BlockMmadFAG(Arch::Resource<ArchTag> &ArchResource, uint32_t l1BufAddrStart_ = 0, uint32_t eventIdStart_ = 0) // eventIdStart给0或4
+    BlockMmadFAG() : l1BufAddrStart(0), eventIdStart(0), bufBound_(false) {}
+
+    CATLASS_DEVICE
+    BlockMmadFAG(Arch::Resource<ArchTag> &ArchResource, uint32_t l1BufAddrStart_ = 0, uint32_t eventIdStart_ = 0)
+    {
+        Reset(ArchResource, l1BufAddrStart_, eventIdStart_);
+    }
+
+    CATLASS_DEVICE
+    void Reset(Arch::Resource<ArchTag> &ArchResource, uint32_t l1BufAddrStart_ = 0, uint32_t eventIdStart_ = 0)
     {
         resource = ArchResource;
         l1BufAddrStart = l1BufAddrStart_;
         eventIdStart = eventIdStart_;
+        bufBound_ = false;
     }
 
+    // Bind L1/L0 tensor views + event IDs once; subsequent SetFlag only re-arms HardEvents.
     CATLASS_DEVICE
-    void SetFlag()
+    void BindBuffers()
     {
+        if (bufBound_) {
+            return;
+        }
         uint32_t l1AOffset = l1BufAddrStart;
         uint32_t l1BOffset = l1BufAddrStart + L1A_SIZE * L1A_STAGES;
-        // Init buffers
         for (uint32_t i = 0; i < L1A_STAGES; i++) {
             l1ATensorList[i] = resource.l1Buf.template GetBufferByByte<ElementA>(l1AOffset + L1A_SIZE * i);
             l1AEventList[i] = i + eventIdStart; // 0 1  or  4 5
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[i]);
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             l1BTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BOffset + L1B_SIZE * i);
             l1BEventList[i] = i + L1A_STAGES + eventIdStart; // 2    or  6
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[i]);
         }
-        
         for (uint32_t i = 0; i < L0AB_STAGES; i++) {
             l0ATensorList[i] = resource.l0ABuf.template GetBufferByByte<ElementA>(L0A_PINGPONG_BUF_SIZE * i);
             l0BTensorList[i] = resource.l0BBuf.template GetBufferByByte<ElementB>(L0B_PINGPONG_BUF_SIZE * i);
             l0AEventList[i] = i + eventIdStart;               // 0 1    or    4 5
             l0BEventList[i] = i + L0AB_STAGES + eventIdStart; // 2 3    or    6 7
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[i]);
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[i]);
         }
-
         for (uint32_t i = 0; i < L0C_STAGES; i++) {
             l0CTensorList[i] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(L0C_PINGPONG_BUF_SIZE * i);
             l0CEventList[i] = i + eventIdStart;
-            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[i]);
         }
         mmadSyncEventId = (eventIdStart + 7) % 8;
+        bufBound_ = true;
+    }
+
+    CATLASS_DEVICE
+    void SetFlag()
+    {
+        BindBuffers();
+        for (uint32_t i = 0; i < L1A_STAGES; i++) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[i]);
+        }
+        for (uint32_t i = 0; i < L1B_STAGES; i++) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[i]);
+        }
+        for (uint32_t i = 0; i < L0AB_STAGES; i++) {
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[i]);
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[i]);
+        }
+        for (uint32_t i = 0; i < L0C_STAGES; i++) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[i]);
+        }
+        // Persistent object: must re-arm stage cursors each call (local objs were always fresh).
+        l1AListId = 0;
+        l0AListId = 0;
+        l0BListId = 0;
     }
 
     CATLASS_DEVICE
@@ -350,6 +380,7 @@ protected:
     uint32_t l1AListId{0};
     uint32_t l0AListId{0};
     uint32_t l0BListId{0};
+    bool bufBound_{false};
 
     TileMmad tileMmad;
     CopyGmToL1A copyGmToL1A;

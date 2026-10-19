@@ -152,8 +152,27 @@ public:
             if (dbParam.blockIdArr[groupId] == -1) {
                 break;
             }
-            if (dbParam.dqGroupId[groupId] < groupId && dbParam.dqGroupId[groupId] != OUTIDX) {
+            // Non-leader of another group — skip.
+            if (dbParam.dqGroupId[groupId] != OUTIDX && dbParam.dqGroupId[groupId] != groupId) {
                 continue;
+            }
+            // OUTIDX means this cube already wrote final WS (s2o==0). A later
+            // s2o>0 cube in the same wave may still set dqGroupId=this core
+            // (same dqOutIdx) and needs merge. Skip only when no followers.
+            if (dbParam.dqGroupId[groupId] == OUTIDX) {
+                bool hasFollowers = false;
+                for (int8_t coreId = groupId + 1; coreId < cubeCoreNum; coreId++) {
+                    if (dbParam.blockIdArr[coreId] == -1) {
+                        break;
+                    }
+                    if (dbParam.dqGroupId[coreId] == groupId) {
+                        hasFollowers = true;
+                        break;
+                    }
+                }
+                if (!hasFollowers) {
+                    continue;
+                }
             }
             event_t vWaitMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_V));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(vWaitMte3);
@@ -239,8 +258,27 @@ public:
             if (dbParam.blockIdArr[groupId] == -1) {
                 break;
             }
-            if (dbParam.kvGroupId[groupId] < groupId && dbParam.kvGroupId[groupId] != OUTIDX) {
+            // Non-leader of another group — skip.
+            if (dbParam.kvGroupId[groupId] != OUTIDX && dbParam.kvGroupId[groupId] != groupId) {
                 continue;
+            }
+            // OUTIDX leader may still own followers (first S1 tile: only
+            // startCore is OUTIDX, later cubes keep kvGroupId=startCore).
+            // Skip only when there are no followers (empty Duplicate).
+            if (dbParam.kvGroupId[groupId] == OUTIDX) {
+                bool hasFollowers = false;
+                for (int8_t coreId = groupId + 1; coreId < cubeCoreNum; coreId++) {
+                    if (dbParam.blockIdArr[coreId] == -1) {
+                        break;
+                    }
+                    if (dbParam.kvGroupId[coreId] == groupId) {
+                        hasFollowers = true;
+                        break;
+                    }
+                }
+                if (!hasFollowers) {
+                    continue;
+                }
             }
             event_t vWaitMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_V));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(vWaitMte3);
