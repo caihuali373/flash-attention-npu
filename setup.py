@@ -154,6 +154,69 @@ def _get_hcc_cpp_include(hcc):
     )
 
 
+def _host_libstdcxx_paths():
+    """bisheng may select a newer host GCC (e.g. 12) whose libstdc++-dev headers
+    are not installed, while an older versioned tree (e.g. /usr/include/c++/11)
+    is present. Return (cpp_inc, arch_inc) for that tree, or (None, None)."""
+    cpp_root = "/usr/include/c++"
+    if os.path.isfile(os.path.join(cpp_root, "cstdint")):
+        return None, None
+    if not os.path.isdir(cpp_root):
+        return None, None
+
+    def _ver_key(name):
+        try:
+            return tuple(int(x) for x in name.split("."))
+        except ValueError:
+            return ()
+
+    versions = [
+        name
+        for name in os.listdir(cpp_root)
+        if os.path.isfile(os.path.join(cpp_root, name, "cstdint"))
+    ]
+    if not versions:
+        return None, None
+    ver = max(versions, key=_ver_key)
+    cpp_inc = os.path.join(cpp_root, ver)
+    arch_inc = os.path.join(
+        "/usr/include", f"{platform.machine()}-linux-gnu", "c++", ver
+    )
+    if not os.path.isdir(arch_inc):
+        arch_inc = None
+    return cpp_inc, arch_inc
+
+
+def _host_libstdcxx_isystem_flags():
+    """Compile-flag form of _host_libstdcxx_paths (covers .cpp front-end)."""
+    cpp_inc, arch_inc = _host_libstdcxx_paths()
+    if not cpp_inc:
+        return []
+    flags = ["-isystem", cpp_inc]
+    if arch_inc:
+        flags += ["-isystem", arch_inc]
+    return flags
+
+
+def _ensure_host_libstdcxx_env():
+    """Also export CPLUS_INCLUDE_PATH/CPATH: device-link stub compiles
+    (__clang_asc_link_eager.stub) invoke bisheng without our -isystem flags."""
+    cpp_inc, arch_inc = _host_libstdcxx_paths()
+    if not cpp_inc:
+        return
+    extras = [cpp_inc] + ([arch_inc] if arch_inc else [])
+    for key in ("CPLUS_INCLUDE_PATH", "CPATH"):
+        cur = os.environ.get(key, "")
+        parts = [p for p in cur.split(os.pathsep) if p]
+        for path in extras:
+            if path not in parts:
+                parts.insert(0, path)
+        os.environ[key] = os.pathsep.join(parts)
+
+
+_ensure_host_libstdcxx_env()
+
+
 def _cmdhash(compile_common):
     """Stable hash of the per-extension compile flags (arch / -O / ABI / includes).
     A change here means a stored .o was produced with different flags and must be
@@ -307,10 +370,20 @@ class BishengBuildExt(build_ext):
             f"-I{torch_package_path}/include/torch/csrc/api/include",
             f"-I{this_dir}/csrc/catlass/include",
             *extra_includes,
+            *_host_libstdcxx_isystem_flags(),
         ]
+
+        # bisheng/ld.lld needs an explicit -L for libstdc++; host GCC path varies.
+        _libstdcxx_dirs = [
+            "/usr/lib/gcc/aarch64-linux-gnu/11",
+            f"{ascend_home}/tools/hcc/aarch64-target-linux-gnu/lib64",
+            f"{ascend_home}/toolkit/toolchain/hcc/aarch64-target-linux-gnu/lib64",
+        ]
+        _libstdcxx_L = [f"-L{d}" for d in _libstdcxx_dirs if os.path.isdir(d)]
 
         link_flags = [
             *[f"-L{p}" for p in asc_lib_paths],
+            *_libstdcxx_L,
             f"-L{torch_lib}",
             f"-L{torch_npu_lib}",
             f"-L{torch_package_path}/lib",

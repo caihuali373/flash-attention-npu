@@ -298,10 +298,6 @@ std::vector<at::Tensor> mha_fwd_kvcache(
     }
     if (out_.has_value()) {
         out = out_.value();
-    } else if (layout == 2) {
-        // BNSD (B,H,S,D) input: the kernel reads BNSD but writes contiguous BSND, so
-        // allocate the output as (B, S, H, dv) instead of empty_like(q) == (B,H,S,D).
-        out = torch::empty({q.size(0), q.size(2), q.size(1), vcache.size(-1)}, q.options());
     } else {
         out = torch::empty_like(q);
     }
@@ -723,11 +719,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
     }
 
     // init output tensors
-    // BNSD (B,H,S,D) input: the kernel writes contiguous BSND, so allocate (B, S, H, dv).
-    at::Tensor out = (out_.has_value())
-                         ? out_.value()
-                         : (is_bnsd ? torch::empty({batch_size, seqlen_q, num_heads, head_size}, q.options())
-                                    : torch::empty_like(q));
+    at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
     auto opts = q.options().device(at::kPrivateUse1);
     auto p = torch::empty({0}, opts);
     if (return_softmax) {
@@ -1339,8 +1331,10 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     AlibiSlopes alibi = set_params_alibi(alibi_slopes_, seqlens_q.numel() - 1, qsizes[1]);
     bool has_alibi = alibi.ptr != nullptr;
 
-    // varlen optimized kernel only supports headdim equal to 128
-    if (!seqlens_q.equal(seqlens_k) || is_local || p_dropout > 0.0f || headdim != 128) {
+    // VarlenOpt: headdim==128, no dropout/local. Unequal Q/K (Cross, NO_MASK) is OK —
+    // dual-addr already splits cu_seq_q/k; keep unequal+causal on general until validated.
+    const bool unequal_seq = !seqlens_q.equal(seqlens_k);
+    if (is_local || p_dropout > 0.0f || headdim != 128 || (unequal_seq && local_is_causal)) {
         float scale = softmax_scale > 0.f ? softmax_scale : (1.0f / sqrt(static_cast<float>(headdim)));
         return launch_fag_general(dout, q, k, v, out, softmax_lse, dq, dk, dv, seqlens_q, seqlens_k, max_seqlen_q,
                                   max_seqlen_k, scale, softcap, local_is_causal, local_window_size_left,
@@ -1352,10 +1346,10 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     uint32_t tilingSize = TILING_PARA_NUM * sizeof(int64_t);
     at::Tensor tiling_cpu_tensor = at::empty({tilingSize}, at::device(c10::kCPU).dtype(at::kByte));
     FAGTiling::FAGInfo fagInfo;
-    int64_t sum_of_list = qsizes[0];
     fagInfo.seqQShapeSize = cu_seqlens_q.sizes()[0] - 1;
-    fagInfo.queryShape_0 = sum_of_list;
-    fagInfo.keyShape_0 = sum_of_list;
+    // Must use real totals: keyShape_0 = total_k (was wrongly total_q; breaks Cross kv WS)
+    fagInfo.queryShape_0 = qsizes[0];
+    fagInfo.keyShape_0 = ksizes[0];
     fagInfo.queryShape_1 = nheads;
     fagInfo.keyShape_1 = nheads_k;
     fagInfo.queryShape_2 = headdim;
