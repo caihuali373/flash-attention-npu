@@ -88,6 +88,7 @@ class BlockEpilogue<EpilogueAtlasA2FAGDtmAdd<INPUT_LAYOUT_>> {
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
     constexpr static uint32_t INPUT_NUMS = 2;
     constexpr static int64_t GM_DOUBLE_BUFFER = 2;
+    constexpr static int64_t GM_DTM_BUFFER = 3;
     constexpr static uint32_t ADDR_ALIGN_SIZE = 512;
 
     constexpr static int8_t OUTIDX = -1;
@@ -147,7 +148,7 @@ class BlockEpilogue<EpilogueAtlasA2FAGDtmAdd<INPUT_LAYOUT_>> {
     void CalcDqReduce(DBParams& dbParam, GlobalTensor<float>& srcTensor, GlobalTensor<float>& dstTensor, int64_t d,
                       int64_t dAlign, uint32_t vecCalBlockNum)
     {
-        pingpongIdx = dbParam.taskId % 2;
+        pingpongIdx = dbParam.taskId % GM_DTM_BUFFER;
         uint32_t s1CalcInner = (s1CvInner + vecCalBlockNum - 1) / vecCalBlockNum;
         int64_t singleCoreDataNum = s1CalcInner * dAlign;
 
@@ -243,7 +244,7 @@ class BlockEpilogue<EpilogueAtlasA2FAGDtmAdd<INPUT_LAYOUT_>> {
     void CalcDkvReduce(DBParams& dbParam, GlobalTensor<float>& srcTensor, GlobalTensor<float>& dstTensor, int64_t d,
                        int64_t dAlign, uint32_t vecCalBlockNum)
     {
-        pingpongIdx = dbParam.taskId % 2;
+        pingpongIdx = dbParam.taskId % GM_DTM_BUFFER;
         uint32_t s2CalcInner = (s2CvInner + vecCalBlockNum - 1) / vecCalBlockNum;
         int64_t singleCoreDataNum = s2CalcInner * dAlign;
 

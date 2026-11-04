@@ -42,6 +42,7 @@ using namespace AscendC;
 
 constexpr static uint32_t ADDR_ALIGN_SIZE = 512;
 constexpr static int64_t GM_DOUBLE_BUFFER = 2;
+constexpr static int64_t GM_DTM_BUFFER = 3; // match FAGTiling::GM_DTM_BUFFER
 constexpr static uint32_t DTYPE_FACTOR = 2; // T2=float，T1=fp16/bf16
 constexpr static uint32_t S_SPLITT_SIZE = 256;
 constexpr static uint32_t MMAD_BASE_SIZE = 128;
@@ -68,7 +69,8 @@ enum class DTemplateType {
 
 template <class BlockMmad_, class BlockMmad2_, class BlockMmad3_, class EpilogueFAGPre_, class EpilogueFAGSfmg_,
           class EpilogueFAGSabVec_, class EpilogueFAGPost_, class EpilogueFAGDtmAdd_, const uint32_t INPUT_LAYOUT,
-          const bool IS_ATTEN_MASK, const uint32_t IS_DTM, const bool USE_ACTUAL_OUT = false>
+          const bool IS_ATTEN_MASK, const uint32_t IS_DTM,
+          const DTemplateType DTEMPLATETYPE = DTemplateType::NonAligned, const bool USE_ACTUAL_OUT = false>
 class FlashAttentionScoreGrad {
   public:
     using BlockMmad = BlockMmad_;
@@ -224,12 +226,12 @@ class FlashAttentionScoreGrad {
             workspaceOffsets = (pseAlibiAddr + ADDR_ALIGN_SIZE - 1) / ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
 
             dqDtmWsGm.SetGlobalBuffer((__gm__ float*)(params.workspace + workspaceOffsets));
-            workspaceOffsets = (workspaceOffsets + s1CvInner * dAlign * sizeof(float) * cubeCoreNum * GM_DOUBLE_BUFFER +
+            workspaceOffsets = (workspaceOffsets + s1CvInner * dAlign * sizeof(float) * cubeCoreNum * GM_DTM_BUFFER +
                                 ADDR_ALIGN_SIZE - 1) /
                                ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
 
             dkDtmWsGm.SetGlobalBuffer((__gm__ float*)(params.workspace + workspaceOffsets));
-            workspaceOffsets = (workspaceOffsets + s2CvInner * dAlign * sizeof(float) * cubeCoreNum * GM_DOUBLE_BUFFER +
+            workspaceOffsets = (workspaceOffsets + s2CvInner * dAlign * sizeof(float) * cubeCoreNum * GM_DTM_BUFFER +
                                 ADDR_ALIGN_SIZE - 1) /
                                ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
 
@@ -511,15 +513,23 @@ class FlashAttentionScoreGrad {
             dbParam.s2Stride = n2 * d;
         }
 
+        // D=64/128/192/256: Cube1 TSCM (DataCopy / Mmad / Fixpipe).
+        // D>128 uses K-split (L0A 32KB). NonAligned / MLA: stack Catlass BlockMmad.
+        if constexpr (DTEMPLATETYPE == DTemplateType::Aligned64 || DTEMPLATETYPE == DTemplateType::Aligned128 ||
+                      DTEMPLATETYPE == DTemplateType::Aligned192 || DTEMPLATETYPE == DTemplateType::Aligned256) {
+            ComputeMM1Cube1Tscm(dbParam);
+            return;
+        }
+
         int64_t s1_size = dbParam.actualS1Len;
 
-        // dy * v need align the d to value_d.
+        // dy * v: align offsets to value_d.
         int64_t specify_for_v_aTensorOffsetCv = InputOffset(inputStrides.dout, dbParam, true);
         int64_t specify_for_v_bTensorOffsetCv = InputOffset(inputStrides.v, dbParam, false);
         int64_t specify_for_v_s1Stride = inputStrides.dout.sequence;
         int64_t specify_for_v_s2Stride = inputStrides.v.sequence;
 
-        // mm-dyv
+        // mm-dyv (stack-local BlockMmad; not persisted across SyncAll)
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, dbParam.s2CvExtend, value_d);
         LayoutA layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), specify_for_v_s1Stride};
         LayoutB layoutB1{actualBlockShape1.k(), actualBlockShape1.n(),
@@ -543,14 +553,25 @@ class FlashAttentionScoreGrad {
         LayoutA layoutA{actualBlockShape.m(), actualBlockShape.k(), inputStrides.q.sequence};
         LayoutB layoutB{actualBlockShape.k(), actualBlockShape.n(), inputStrides.k.sequence};
         LayoutC layoutC{actualBlockShape.m(), actualBlockShape.n(), dbParam.s2CvExtendAlign};
-        BlockMmad blockMmadQk(resource);
-        blockMmadQk(queryGm[InputOffset(inputStrides.q, dbParam, true)], layoutA,
-                    keyGm[InputOffset(inputStrides.k, dbParam, false)], layoutB,
-                    mm2WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC, actualBlockShape, !shortHeadSchedule, true);
+        {
+            BlockMmad blockMmadQk(resource);
+            blockMmadQk(queryGm[InputOffset(inputStrides.q, dbParam, true)], layoutA,
+                        keyGm[InputOffset(inputStrides.k, dbParam, false)], layoutB,
+                        mm2WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC, actualBlockShape, !shortHeadSchedule, true);
+        }
     }
 
     __aicore__ inline void ComputeMMDqkv(DBParams& dbParam, int64_t nextBlockId)
     {
+        // D64 SameAB requires C0-aligned s1/s2; unaligned tails use MatmulImpl.
+        if constexpr (DTEMPLATETYPE == DTemplateType::Aligned64) {
+            const bool sameAbSafe = (dbParam.s1CvExtend > 0) && (dbParam.s2CvExtend > 0) &&
+                                    ((dbParam.s1CvExtend & 15) == 0) && ((dbParam.s2CvExtend & 15) == 0);
+            if (sameAbSafe) {
+                ComputeMMDqkvSameAbD64(dbParam, nextBlockId);
+                return;
+            }
+        }
         pingpongIdx = dbParam.taskId % 2;
         const bool accumulateDq = !shortHeadSchedule;
         const bool accumulateKv = !shortHeadSchedule || dbParam.s1oIdx != 0;
@@ -612,52 +633,55 @@ class FlashAttentionScoreGrad {
         uint32_t gmBaseBlockOffset = 0;
 
         // ///////////////////////////////////////////////////////////////
-        // // Matmal4 dq
+        // Matmul3 dq
         // ///////////////////////////////////////////////////////////////
         // // left [B, N2, G, S1, s2] right [B, N2, 1, S2, D] output [B, N2, G, S1, D]
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, d, dbParam.s2CvExtend);
-        LayoutA2 layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), s2_size}; // RowMajor  shape=(s1,s2)  stride=s2
+        LayoutA2 layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), s2_size};
         LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), inputStrides.k.sequence};
         LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc};
-        {
-            BlockMmad2 blockMmad2(resource);
-            blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], keyGm[InputOffset(inputStrides.k, dbParam, false)],
-                       dqWorkSpaceGm[dqOffset], layoutA1, layoutB1, layoutC1, actualBlockShape1, accumulateDq);
+        if (!blockMmad2Inited) {
+            blockMmad2Persist.Init(resource, 0, 0);
+            blockMmad2Inited = true;
         }
+        // dq @ eventIdStart=0; causal atomic prefix applies to dk/dv only.
+        blockMmad2Persist(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                          keyGm[InputOffset(inputStrides.k, dbParam, false)], dqWorkSpaceGm[dqOffset], layoutA1,
+                          layoutB1, layoutC1, actualBlockShape1, accumulateDq, 0xffffffffU, true);
+        blockMmad2Armed = false;
 
-        // dq GM write done; blockMmad3 reuses same L1
-        AscendC::PipeBarrier<PIPE_MTE3>();
-
-        BlockMmad3 blockMmad3(resource, 0, 4);
-        // ///////////////////////////////////////////////////////////////
-        // // left [B, N2, G, S1, S2] right [B, N2, 1, S1, D] output [B, N2, G, S2, D]
+        // dk/dv share BlockMmad3 @ eventIdStart=4 (disjoint from sdp 0+).
+        (void)nextBlockId;
+        if (!blockMmad3Inited) {
+            blockMmad3Persist.Init(resource, 0, 4);
+            blockMmad3Inited = true;
+        }
+        // Matmul4 dk — sync=false; dv waits FIX_M after GM→L1B.
         GemmCoord actualBlockShape2(dbParam.s2CvExtend, d, dbParam.s1CvExtend);
         LayoutA3 layoutA2{actualBlockShape2.m(), actualBlockShape2.k(),
-                          s2_size}; // ColumnMajor  origin shape=(s2,s1), so stride=s2
+                          s2_size}; // ColumnMajor origin shape=(s2,s1), stride=s2
         LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), inputStrides.q.sequence};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
-        blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], queryGm[InputOffset(inputStrides.q, dbParam, true)],
-                   dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2, actualBlockShape2, accumulateKv,
-                   atomicKvRows);
+        blockMmad3Persist(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                          queryGm[InputOffset(inputStrides.q, dbParam, true)], dkWorkSpaceGm[dkvOffset], layoutA2,
+                          layoutB2, layoutC2, actualBlockShape2, accumulateKv, atomicKvRows, false);
 
-        AscendC::PipeBarrier<PIPE_MTE3>();
-
-        // ///////////////////////////////////////////////////////////////
-        // // Matmal5 dv
-        // ///////////////////////////////////////////////////////////////
-        // // left [B, N2, G, S1, S2] right [B, N2, G, S1, D2] output [B, N2, 1, S2, D2]
+        // Matmul5 dv
         GemmCoord actualBlockShape3(dbParam.s2CvExtend, value_d, dbParam.s1CvExtend);
         LayoutA3 layoutA3{actualBlockShape3.m(), actualBlockShape3.k(), s2_size};
         LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), inputStrides.dout.sequence};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
-        blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], dxGm[InputOffset(inputStrides.dout, dbParam, true)],
-                   dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3, actualBlockShape3, accumulateKv,
-                   atomicKvRows);
+        // dv: sync=true so the last fixpipe drains before return.
+        blockMmad3Persist(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                          dxGm[InputOffset(inputStrides.dout, dbParam, true)], dvWorkSpaceGm[dvOffset], layoutA3,
+                          layoutB3, layoutC3, actualBlockShape3, accumulateKv, atomicKvRows, true);
     }
 
     __aicore__ inline void DTMComputeMMDqkv(DBParams& dbParam, int64_t nextBlockId)
     {
-        pingpongIdx = dbParam.taskId % 2;
+        // MM1/P: DB_NUM pingpong; DTM partials: GM_DTM_BUFFER.
+        pingpongIdx = dbParam.taskId % GM_DOUBLE_BUFFER;
+        const uint32_t dtmPing = dbParam.taskId % GM_DTM_BUFFER;
         int64_t dqOffset = 0;
         int64_t dqRopeOffset = 0;
         int64_t dkvOffset = 0;
@@ -675,13 +699,13 @@ class FlashAttentionScoreGrad {
         int64_t dkvOutMStride = dbParam.actualS2Len;
         int64_t dvOutMStride = dbParam.actualS2Len;
         if (dbParam.dqGroupId[cCubeBlockIdx] != OUTIDX) {
-            dqOffset = pingpongIdx * cubeCoreNum * s1CvInner * dAlign + cCubeBlockIdx * s1CvInner * dAlign;
+            dqOffset = dtmPing * cubeCoreNum * s1CvInner * dAlign + cCubeBlockIdx * s1CvInner * dAlign;
             dqKc = d;
             dqOutMStride = dbParam.s1CvExtend;
         }
         if (dbParam.kvGroupId[cCubeBlockIdx] != OUTIDX) {
-            dkvOffset = pingpongIdx * cubeCoreNum * s2CvInner * dAlign + cCubeBlockIdx * s2CvInner * dAlign;
-            dvOffset = pingpongIdx * cubeCoreNum * s2CvInner * value_dAlign + cCubeBlockIdx * s2CvInner * value_dAlign;
+            dkvOffset = dtmPing * cubeCoreNum * s2CvInner * dAlign + cCubeBlockIdx * s2CvInner * dAlign;
+            dvOffset = dtmPing * cubeCoreNum * s2CvInner * value_dAlign + cCubeBlockIdx * s2CvInner * value_dAlign;
             dkvKc = d;
             dvKc = value_d;
             dkvOutMStride = dbParam.s2CvExtend;
@@ -692,33 +716,35 @@ class FlashAttentionScoreGrad {
         int64_t s2_size = dbParam.s2CvExtendAlign * DTYPE_FACTOR;
 
         ///////////////////////////////////////////////////////////////
-        // Matmal4 dq
+        // Matmul3 dq — sync=true; AIV DtmAdd reads after SyncAll.
         ///////////////////////////////////////////////////////////////
         // left [B, N2, G, S1, s2] right [B, N2, 1, S2, D] output [B, N2, G, S1, D]
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, d, dbParam.s2CvExtend);
         LayoutA2 layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), s2_size};
         LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), inputStrides.k.sequence};
         LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc};
-        {
-            BlockMmad2 blockMmad2(resource);
-            if (dbParam.dqGroupId[cCubeBlockIdx] == OUTIDX) {
-                blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                           keyGm[InputOffset(inputStrides.k, dbParam, false)], dqWorkSpaceGm[dqOffset], layoutA1,
-                           layoutB1, layoutC1, actualBlockShape1, false);
-            } else {
-                blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                           keyGm[InputOffset(inputStrides.k, dbParam, false)], dqDtmWsGm[dqOffset], layoutA1, layoutB1,
-                           layoutC1, actualBlockShape1, false);
-            }
+        if (!blockMmad2Inited) {
+            blockMmad2Persist.Init(resource, 0, 0);
+            blockMmad2Inited = true;
+        }
+        if (dbParam.dqGroupId[cCubeBlockIdx] == OUTIDX) {
+            blockMmad2Persist(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                              keyGm[InputOffset(inputStrides.k, dbParam, false)], dqWorkSpaceGm[dqOffset], layoutA1,
+                              layoutB1, layoutC1, actualBlockShape1, false, 0xffffffffU, true);
+        } else {
+            blockMmad2Persist(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                              keyGm[InputOffset(inputStrides.k, dbParam, false)], dqDtmWsGm[dqOffset], layoutA1,
+                              layoutB1, layoutC1, actualBlockShape1, false, 0xffffffffU, true);
+        }
+        blockMmad2Armed = false;
+
+        if (!blockMmad3Inited) {
+            blockMmad3Persist.Init(resource, 0, 4);
+            blockMmad3Inited = true;
         }
 
-        // dq GM write done; blockMmad3 reuses same L1
-        AscendC::PipeBarrier<PIPE_MTE3>();
-
-        BlockMmad3 blockMmad3(resource, 0, 4);
-
         ///////////////////////////////////////////////////////////////
-        // Matmal4 dk
+        // Matmul4 dk
         ///////////////////////////////////////////////////////////////
         // left [B, N2, G, S1, S2] right [B, N2, 1, S1, D] output [B, N2, G, S2, D]
         GemmCoord actualBlockShape2(dbParam.s2CvExtend, d, dbParam.s1CvExtend);
@@ -726,19 +752,17 @@ class FlashAttentionScoreGrad {
         LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), inputStrides.q.sequence};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
         if (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX) {
-            blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                       queryGm[InputOffset(inputStrides.q, dbParam, true)], dkWorkSpaceGm[dkvOffset], layoutA2,
-                       layoutB2, layoutC2, actualBlockShape2, false);
+            blockMmad3Persist(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                              queryGm[InputOffset(inputStrides.q, dbParam, true)], dkWorkSpaceGm[dkvOffset], layoutA2,
+                              layoutB2, layoutC2, actualBlockShape2, false, 0xffffffffU, true);
         } else {
-            blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                       queryGm[InputOffset(inputStrides.q, dbParam, true)], dkDtmWsGm[dkvOffset], layoutA2, layoutB2,
-                       layoutC2, actualBlockShape2, false);
+            blockMmad3Persist(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                              queryGm[InputOffset(inputStrides.q, dbParam, true)], dkDtmWsGm[dkvOffset], layoutA2,
+                              layoutB2, layoutC2, actualBlockShape2, false, 0xffffffffU, true);
         }
 
-        AscendC::PipeBarrier<PIPE_MTE3>();
-
         ///////////////////////////////////////////////////////////////
-        // Matmal5 dv
+        // Matmul5 dv — sync=true before CrossCoreSetFlag.
         ///////////////////////////////////////////////////////////////
         // left [B, N2, G, S1, S2] right [B, N2, G, S1, D2] output [B, N2, 1, S2, D2]
         GemmCoord actualBlockShape3(dbParam.s2CvExtend, value_d, dbParam.s1CvExtend);
@@ -746,14 +770,15 @@ class FlashAttentionScoreGrad {
         LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), inputStrides.dout.sequence};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
         if (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX) {
-            blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                       dxGm[InputOffset(inputStrides.dout, dbParam, true)], dvWorkSpaceGm[dvOffset], layoutA3, layoutB3,
-                       layoutC3, actualBlockShape3, false);
+            blockMmad3Persist(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                              dxGm[InputOffset(inputStrides.dout, dbParam, true)], dvWorkSpaceGm[dvOffset], layoutA3,
+                              layoutB3, layoutC3, actualBlockShape3, false, 0xffffffffU, true);
         } else {
-            blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                       dxGm[InputOffset(inputStrides.dout, dbParam, true)], dvDtmWsGm[dvOffset], layoutA3, layoutB3,
-                       layoutC3, actualBlockShape3, false);
+            blockMmad3Persist(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
+                              dxGm[InputOffset(inputStrides.dout, dbParam, true)], dvDtmWsGm[dvOffset], layoutA3,
+                              layoutB3, layoutC3, actualBlockShape3, false, 0xffffffffU, true);
         }
+        (void)nextBlockId;
     }
 
     // Methods
@@ -832,6 +857,13 @@ class FlashAttentionScoreGrad {
             if (blockStartIdx == -1) {
                 extraLoopNum -= 1;
             }
+        }
+        if (blockMmad2Armed) {
+            blockMmad2Persist.Drain();
+            blockMmad2Armed = false;
+        }
+        if (blockMmad3Inited) {
+            blockMmad3Persist.Drain();
         }
         // -----确定性计算，最后做一次全核同步，保证所有核的atomicAdd做完-----
         if constexpr (IS_DTM == ENABLE) {
@@ -942,7 +974,6 @@ class FlashAttentionScoreGrad {
                     SyncAll();
                     epilogueFAGDtmAdd(dbParams[(taskId - 2) % 3], dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm,
                                       dqDtmWsGm, dkDtmWsGm, dvDtmWsGm);
-                    SyncAll();
                 }
             }
             taskId++;
@@ -950,6 +981,7 @@ class FlashAttentionScoreGrad {
                 extraLoopNum -= 1;
             }
         }
+        // Ensure tail cube writes finish before post.
         AscendC::SyncAll();
         pipeVec.Destroy();
 
@@ -1028,6 +1060,17 @@ class FlashAttentionScoreGrad {
     uint32_t pingpongIdx = 1;
 
     uint32_t cubeBaseMN;
+
+    // Persistent dq / dk-dv mmads (Cube1 stays stack-local).
+    BlockMmad2 blockMmad2Persist;
+    bool blockMmad2Inited{false};
+    bool blockMmad2Armed{false};
+    BlockMmad3 blockMmad3Persist;
+    bool blockMmad3Inited{false};
+
+#include "fag_common/cube1_compute_tscm.hpp"
+#include "fag_common/cube23_d64_compute.hpp"
+#include "fag_common/sameab_d64_dqkv.hpp"
 };
 
 // 基础模板
@@ -1037,13 +1080,13 @@ struct TypeSelector;
 // d=64
 template <>
 struct TypeSelector<DTemplateType::Aligned64> {
-    // cube1
-    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<1, 1, true>;
+    // cube1: A-tiled B-fullload (L1A ping-pong), matching D=256/128 strategy
+    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<2, 1, true>;
     using BlockTileShape = GemmShape<512, 512, 64>;
-    using L1TileShapeCube1 = GemmShape<512, 512, 64>;
+    using L1TileShapeCube1 = GemmShape<128, 512, 64>;
     using L0TileShapeCube1 = GemmShape<128, 256, 64>;
 
-    // cube2
+    // cube2: L1A K=256, L1A_STAGES=2.
     using DispatchPolicyCube2 = Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>;
     using BlockTileShapeCube2 = GemmShape<512, 64, 512>;
     using L1ATileShapeCube2 = GemmShape<128, 0, 256>;
@@ -1054,10 +1097,11 @@ struct TypeSelector<DTemplateType::Aligned64> {
 // d=128
 template <>
 struct TypeSelector<DTemplateType::Aligned128> {
-    // cube1
-    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<1, 1, true>;
+    // cube1: A-tiled B-fullload (L1A ping-pong). D=128 MM1 takes the TSCM path;
+    // this shape is the Catlass fallback if that early-return is off.
+    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<2, 1, true>;
     using BlockTileShape = GemmShape<512, 512, 128>;
-    using L1TileShapeCube1 = GemmShape<512, 512, 128>;
+    using L1TileShapeCube1 = GemmShape<128, 512, 128>;
     using L0TileShapeCube1 = GemmShape<128, 128, 128>;
 
     // cube2
@@ -1071,16 +1115,21 @@ struct TypeSelector<DTemplateType::Aligned128> {
 // d=192
 template <>
 struct TypeSelector<DTemplateType::Aligned192> {
-    // cube1
-    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<2, 2, true>;
+    // MM1: Cube1 TSCM + B-fullload + K-split (see ComputeMM1Cube1Tscm).
+    // Catlass Cube1 shapes for residual path (N=512, L1A ping-pong).
+    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<2, 1, true>;
     using BlockTileShape = GemmShape<512, 512, 192>;
-    using L1TileShapeCube1 = GemmShape<128, 128, 128>;
+    using L1TileShapeCube1 = GemmShape<128, 512, 192>;
     using L0TileShapeCube1 = GemmShape<128, 128, 128>;
+    static_assert(L1TileShapeCube1::M * L1TileShapeCube1::K * 2 * 2 +
+                          L1TileShapeCube1::N * L1TileShapeCube1::K * 2 * 1 <=
+                      512 * 1024,
+                  "Aligned192 L1A ping-pong + B fullload must fit L1");
 
-    // cube2
+    // cube2: L1A K=256 (L1 tot 320KB).
     using DispatchPolicyCube2 = Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>;
     using BlockTileShapeCube2 = GemmShape<512, 192, 512>;
-    using L1ATileShapeCube2 = GemmShape<128, 0, 128>;
+    using L1ATileShapeCube2 = GemmShape<128, 0, 256>;
     using L1BTileShapeCube2 = GemmShape<0, 192, 512>;
     using L0TileShapeCube2 = GemmShape<128, 192, 64>;
 };
@@ -1088,16 +1137,21 @@ struct TypeSelector<DTemplateType::Aligned192> {
 // d=256
 template <>
 struct TypeSelector<DTemplateType::Aligned256> {
-    // cube1
+    // MM1: Cube1 TSCM + K-split (see ComputeMM1Cube1Tscm). Catlass Cube1 shapes
+    // retained for TypeSelector completeness / residual stack paths.
     using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<2, 1, true>;
     using BlockTileShape = GemmShape<512, 512, 256>;
     using L1TileShapeCube1 = GemmShape<128, 512, 256>;
     using L0TileShapeCube1 = GemmShape<128, 128, 128>;
+    static_assert(L1TileShapeCube1::M * L1TileShapeCube1::K * 2 * 2 +
+                          L1TileShapeCube1::N * L1TileShapeCube1::K * 2 * 1 <=
+                      512 * 1024,
+                  "Aligned256 L1A ping-pong + B fullload must fit L1");
 
-    // cube2
+    // cube2: L1A K=256 (L1 tot 384KB; align D64/128 dqkv K-tile).
     using DispatchPolicyCube2 = Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>;
     using BlockTileShapeCube2 = GemmShape<512, 256, 512>;
-    using L1ATileShapeCube2 = GemmShape<128, 0, 128>;
+    using L1ATileShapeCube2 = GemmShape<128, 0, 256>;
     using L1BTileShapeCube2 = GemmShape<0, 256, 512>;
     using L0TileShapeCube2 = GemmShape<128, 256, 64>;
 };
@@ -1273,7 +1327,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     // Kernel level
     using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre,
                                               EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd,
-                                              INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM, USE_ACTUAL_OUT>;
+                                              INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM, DTEMPLATETYPE, USE_ACTUAL_OUT>;
     FAGKernelParams params{
         dout,         q,        k,         v,   out, drop_mask, atten_mask,    softmax_lse, cu_seq_qlen,
         cu_seq_kvlen, seqUsedQ, seqUsedKv, dq_, dk_, dv_,       alibi_slopes_, workspace,   tiling};

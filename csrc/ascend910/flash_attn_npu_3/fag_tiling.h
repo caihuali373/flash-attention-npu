@@ -21,7 +21,7 @@ constexpr uint32_t FP32_BYTES = 4;
 constexpr uint32_t FP32_BLOCK_NUMS = 8;
 constexpr uint32_t BASIC_BLOCK_MULTIPLE = 15;
 constexpr uint32_t SHAPE_INFO = 32;
-constexpr uint32_t BYTE_BLOCK = 32;     // 32 B in block
+constexpr uint32_t BYTE_BLOCK = 32; // 32 B in block
 constexpr int64_t GM_ALIGN = 512;
 constexpr uint32_t MUL_CORE_SYNC_BUFFER = 64 * 1024;
 constexpr uint32_t BOOL_BLOCK_NUMS = 32;
@@ -35,6 +35,8 @@ constexpr uint32_t MATMUL_SIZE = 8 * 1024;
 constexpr uint32_t TOTAL_BLOCK_PIPELINE = 64;
 constexpr uint32_t SAMEAB_S1_256 = 256;
 constexpr uint32_t DB_NUM = 2;
+// DTM dq/dk/dv partial GM depth; MM1/MM2 pingpong stays at DB_NUM.
+constexpr uint32_t GM_DTM_BUFFER = 3;
 constexpr int64_t VEC_SPLIT_NUM = 3;
 constexpr int64_t TOTAL_SIZE = 189 * 1024;
 constexpr float HALF = 0.5f;
@@ -69,11 +71,11 @@ struct FAGInfo {
     int64_t vHeadDim = 0;
     int64_t window_size_left;
     int64_t window_size_right;
-    int32_t *qSeqlenList{nullptr};
-    int32_t *kvSeqlenList{nullptr};
+    int32_t* qSeqlenList{nullptr};
+    int32_t* kvSeqlenList{nullptr};
     // Optional per-batch *used* lengths; heuristics only, sizes stay region-based.
-    int32_t *qUsedLenList{nullptr};
-    int32_t *kvUsedLenList{nullptr};
+    int32_t* qUsedLenList{nullptr};
+    int32_t* kvUsedLenList{nullptr};
     bool isDeterministic = false;
     int64_t alibiSlopesBatchStride = 0;
 };

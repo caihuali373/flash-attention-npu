@@ -87,8 +87,9 @@ public:
     // static constexpr bool ENABLE_UNIT_FLAG = DispatchPolicy::ENABLE_UNIT_FLAG;
 
     static constexpr bool ENABLE_UNIT_FLAG = true;
-    static constexpr uint32_t L1A_STAGES = 2;
-    static constexpr uint32_t L1B_STAGES = 1;
+    // Honor TypeSelector DispatchPolicy for L1A/L1B stages.
+    static constexpr uint32_t L1A_STAGES = DispatchPolicy::L1A_STAGES;
+    static constexpr uint32_t L1B_STAGES = DispatchPolicy::L1B_STAGES;
     static constexpr uint32_t L0AB_STAGES = 2;
     static constexpr uint32_t L0C_STAGES = 1;
 
@@ -142,11 +143,22 @@ public:
     static_assert(L0C_TILE_SIZE <= L0C_SIZE, "L0TileShape exceeding the L0C space!");
 
     CATLASS_DEVICE
+    BlockMmadFAG() : flagsReady(false), l1BufAddrStart(0), eventIdStart(0) {}
+
+    CATLASS_DEVICE
     BlockMmadFAG(Arch::Resource<ArchTag> &ArchResource, uint32_t l1BufAddrStart_ = 0, uint32_t eventIdStart_ = 0) // eventIdStart给0或4
+    {
+        Init(ArchResource, l1BufAddrStart_, eventIdStart_);
+    }
+
+    CATLASS_DEVICE
+    void Init(Arch::Resource<ArchTag> &ArchResource, uint32_t l1BufAddrStart_ = 0, uint32_t eventIdStart_ = 0)
     {
         resource = ArchResource;
         l1BufAddrStart = l1BufAddrStart_;
         eventIdStart = eventIdStart_;
+        flagsReady = false;
+        fixInFlight = false;
     }
 
     CATLASS_DEVICE
@@ -205,38 +217,121 @@ public:
         for (uint32_t i = 0; i < L0C_STAGES; i++) {
             AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[i]);
         }
+        // Match stack-object lifetime for persistent members.
+        l1AListId = 0;
+        l0AListId = 0;
+        l0BListId = 0;
     }
 
-// tile AL1; B按N(D维)分L1BTileShape::N列段载入，D<=256时只有一段，与满载等价
+    // Drain + clear flagsReady so the next call re-arms via SetFlag.
+    CATLASS_DEVICE
+    void Drain()
+    {
+        if (flagsReady) {
+            WaitFlag();
+            flagsReady = false;
+        }
+        fixInFlight = false;
+    }
+
+// tile AL1; B按N(D维)分L1BTileShape::N列段载入，D<=L1B.N时只有一段，与满载等价
+// sync=true: drain all L1/L0/FIX events before return (safe default).
+// sync=false: leave the last FIX_M in flight so the next call on this object
+// can overlap MTE2 with that fixpipe. Only the single-N-tile path honors it.
+// nTileCount>1 and the MLA 192 path always fully sync.
 CATLASS_DEVICE
 void operator()(
     AscendC::GlobalTensor<ElementA> gmBlockA,  // Q^T: (D, M)
     AscendC::GlobalTensor<ElementB> gmBlockB,  // dO: (M, N)
     AscendC::GlobalTensor<ElementC> gmBlockC,  // dk: (D, N)
     LayoutA layoutA, LayoutB layoutB, LayoutC layoutC,
-    GemmCoord actualShape, const bool enAtomic, uint32_t atomicRows = 0xffffffffU)
+    GemmCoord actualShape, const bool enAtomic, uint32_t atomicRows = 0xffffffffU, const bool sync = true)
 {
-    SetFlag();
+    if (!flagsReady) {
+        SetFlag();
+        flagsReady = true;
+    }
     if constexpr (ENABLE_MLA_ALIGNED192_L1_TILES) {
+        // MLA copies B inside the m-loop, so the single-tile FIX overlap prologue
+        // does not apply. Always drain, including when a prior call left FIX in flight.
+        if (fixInFlight) {
+            WaitFlag();
+            SetFlag();
+            fixInFlight = false;
+        }
         GemmMlaAligned192L1Tiles(gmBlockA, gmBlockB, gmBlockC, layoutA, layoutB, layoutC, actualShape, enAtomic,
                                  atomicRows);
         WaitFlag();
+        flagsReady = false;
+        fixInFlight = false;
         return;
     }
     uint32_t actualN = actualShape.n();
 
     uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(actualN);
 
-    // N(D)方向按L1B列容量切段，D<=256时nTileCount为1，循环体与原满载一致
+    // N(D)方向按L1B列容量切段，D<=L1B.N时nTileCount为1，循环体与原满载一致
     uint32_t nTileCount = CeilDiv<L1BTileShape::N>(nRound);
 
-    for (uint32_t nTileIdx = 0; nTileIdx < nTileCount; nTileIdx++) {
-        uint32_t nBegin = nTileIdx * L1BTileShape::N;
-        uint32_t nAct = (nTileIdx < nTileCount - 1) ? L1BTileShape::N : (actualN - nTileIdx * L1BTileShape::N);
-        GemmNTile(gmBlockA, gmBlockB, gmBlockC, layoutA, layoutB, layoutC, actualShape, nBegin, nAct, enAtomic);
+    // Multi-segment L1B re-arms MTE1_MTE2 between tiles. The sync=false prologue
+    // assumes one self-synced full load and a single trailing FIX_M, so force a
+    // full drain whenever the output is split across N tiles.
+    if (nTileCount > 1) {
+        if (fixInFlight) {
+            WaitFlag();
+            SetFlag();
+            fixInFlight = false;
+        }
+        for (uint32_t nTileIdx = 0; nTileIdx < nTileCount; nTileIdx++) {
+            uint32_t nBegin = nTileIdx * L1BTileShape::N;
+            uint32_t nAct = (nTileIdx < nTileCount - 1) ? L1BTileShape::N : (actualN - nTileIdx * L1BTileShape::N);
+            bool skipFixWait = false;
+            GemmNTile(gmBlockA, gmBlockB, gmBlockC, layoutA, layoutB, layoutC, actualShape, nBegin, nAct, enAtomic,
+                      false, skipFixWait);
+        }
+        WaitFlag();
+        flagsReady = false;
+        fixInFlight = false;
+        return;
     }
 
-    WaitFlag();
+    // Previous call returned with its last fixpipe still in flight (sync=false).
+    // L1A/L0 events are already signaled; rewind them so this call does not
+    // inherit the ping-pong phase. Do not touch FIX_M yet.
+    bool skipFixWait = false;
+    if (fixInFlight) {
+        for (uint32_t i = 0; i < L1A_STAGES; i++) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[i]);
+        }
+        for (uint32_t i = 0; i < L0AB_STAGES; i++) {
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[i]);
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[i]);
+        }
+        l1AListId = 0;
+        l0AListId = 0;
+        l0BListId = 0;
+        for (uint32_t i = 0; i < L1A_STAGES; i++) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[i]);
+        }
+        for (uint32_t i = 0; i < L0AB_STAGES; i++) {
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[i]);
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[i]);
+        }
+        fixInFlight = false;
+        skipFixWait = true;
+    }
+    // Single N-tile overlap (L1B Set+Wait, MTE2 over FIX) lives in GemmNTile.
+    GemmNTile(gmBlockA, gmBlockB, gmBlockC, layoutA, layoutB, layoutC, actualShape, 0, actualN, enAtomic, true,
+              skipFixWait);
+
+    if (sync) {
+        WaitFlag();
+        flagsReady = false;
+        fixInFlight = false;
+    } else {
+        // Last tile's FIX_M stays set. The next call copies GM→L1, then waits it.
+        fixInFlight = true;
+    }
 }
 
 CATLASS_DEVICE
@@ -245,7 +340,8 @@ void GemmNTile(
     AscendC::GlobalTensor<ElementB> gmBlockB,  // dO: (M, N)
     AscendC::GlobalTensor<ElementC> gmBlockC,  // dk: (D, N)
     LayoutA layoutA, LayoutB layoutB, LayoutC layoutC,
-    GemmCoord actualShape, uint32_t nBegin, uint32_t nAct, const bool enAtomic)
+    GemmCoord actualShape, uint32_t nBegin, uint32_t nAct, const bool enAtomic, const bool overlapFix,
+    bool &skipFixWait)
 {
     uint32_t actualM = actualShape.m();
     uint32_t actualK = actualShape.k();
@@ -262,21 +358,40 @@ void GemmNTile(
     MatrixCoord BGMTileOffset{0, nBegin};
     auto gmBTile = gmBlockB[layoutB.GetOffset(BGMTileOffset)];
     auto layoutTileB = layoutB.GetTileLayout(MakeCoord(actualK, nAct));
-    // 覆盖写前等待上一N段的全部L1->L0B(MTE1)消费完成（首段消耗SetFlag预置标志）
-    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
-    copyGmToL1B(l1BTensorList[0], gmBTile, layoutBInL1, layoutTileB);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+    if (overlapFix) {
+        // Keep L1B Set+Wait self-sync. Issue GM→L1 before retiring the previous
+        // fixpipe so MTE2 overlaps FIX. No end-of-tile re-arm: the next call
+        // (or WaitFlag) owns the leftover SetFlag count.
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+        copyGmToL1B(l1BTensorList[0], gmBTile, layoutBInL1, layoutTileB);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+        if (skipFixWait) {
+            // SetAtomicNone is PIPE_S and is not ordered with an in-flight FIX store.
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
+        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+    } else {
+        // 覆盖写前等待上一N段的全部L1->L0B(MTE1)消费完成（首段消耗SetFlag预置标志）
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+        copyGmToL1B(l1BTensorList[0], gmBTile, layoutBInL1, layoutTileB);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+    }
     // 【关键】这里Wait完成后，本段L1B数据在本nTile内一直安全可用，循环内不要再有L1B的MTE2_MTE1事件操作。
 
     AscendC::SetAtomicNone();
 
     uint32_t mL1TileCount = CeilDiv<L1ATileShape::M>(mRound);
     uint32_t kL1TileCount = CeilDiv<L1ATileShape::K>(kRound);
+    // Prefetch next K-tile L1A while current L0/mad runs; also next m-tile k0
+    // during fixpipe (cross-m).
+    bool l1APrefetched = false;
 
     for (uint32_t mL1TileIdx = 0; mL1TileIdx < mL1TileCount; mL1TileIdx++) {
         uint32_t mAL1Actual = (mL1TileIdx < mL1TileCount - 1) ? L1ATileShape::M : (actualM - mL1TileIdx * L1ATileShape::M);
         uint32_t mAL1Round = RoundUp<L1AAlignHelper::M_ALIGNED>(mAL1Actual);
+        // Do not clear l1APrefetched here — cross-m prefetch may have armed it.
         for (uint32_t kAL1TileIdx = 0; kAL1TileIdx < kL1TileCount; kAL1TileIdx++) {
             uint32_t kAL1Actual = (kAL1TileIdx < kL1TileCount - 1) ? L1ATileShape::K : (actualK - kAL1TileIdx * L1ATileShape::K);
 
@@ -286,9 +401,14 @@ void GemmNTile(
             auto gmATile = gmBlockA[layoutA.GetOffset(AGMTileOffset)];
             auto layoutTileAInGM = layoutA.GetTileLayout(MakeCoord(mAL1Actual, kAL1Actual));
 
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
-            copyGmToL1A(l1ATensor, gmATile, layoutAInL1, layoutTileAInGM);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1AListId]);
+            if (!l1APrefetched) {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
+                copyGmToL1A(l1ATensor, gmATile, layoutAInL1, layoutTileAInGM);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1AListId]);
+            } else {
+                // Prefetch already issued + MTE2_MTE1 armed for this stage.
+                l1APrefetched = false;
+            }
 
             uint32_t kL0TileCount = CeilDiv<L0TileShape::K>(kAL1Actual);
 
@@ -307,6 +427,22 @@ void GemmNTile(
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1AListId]);
                 }
                 copyL1ToL0A(l0ATile, l1ATile, layoutAInL0, layoutAInL1);
+                // After L1A is latched into L0, prefetch next K-tile into the
+                // alternate L1A stage so MTE2 overlaps remaining L0/mad.
+                if (kL0TileIdx == 0 && (kAL1TileIdx + 1 < kL1TileCount) && (L1A_STAGES > 1)) {
+                    uint32_t nextL1AId = (l1AListId + 1 < L1A_STAGES) ? (l1AListId + 1) : 0;
+                    uint32_t nextKActual =
+                        (kAL1TileIdx + 1 < kL1TileCount - 1) ? L1ATileShape::K
+                                                            : (actualK - (kAL1TileIdx + 1) * L1ATileShape::K);
+                    MatrixCoord nextAGM{mL1TileIdx * L1ATileShape::M,
+                                        (kAL1TileIdx + 1) * L1ATileShape::K};
+                    auto nextGmA = gmBlockA[layoutA.GetOffset(nextAGM)];
+                    auto nextLayoutGm = layoutA.GetTileLayout(MakeCoord(mAL1Actual, nextKActual));
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[nextL1AId]);
+                    copyGmToL1A(l1ATensorList[nextL1AId], nextGmA, layoutAInL1, nextLayoutGm);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[nextL1AId]);
+                    l1APrefetched = true;
+                }
                 // 最后一个 L0 块搬完后，释放当前的 L1A 给后续 MTE2 覆盖
                 if (kL0TileIdx == kL0TileCount - 1) {
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
@@ -332,9 +468,14 @@ void GemmNTile(
 
                 bool initC = (kAL1TileIdx == 0) && (kL0TileIdx == 0);
 
-                // make sure fixp already finished write, GM then issue mmad to write L0C
+                // make sure fixp already finished write, GM then issue mmad to write L0C.
+                // The overlap prologue already consumed FIX_M for the first tile.
                 if (initC) {
-                    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
+                    if (overlapFix && skipFixWait) {
+                        skipFixWait = false;
+                    } else {
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
+                    }
                 }
 
                 uint8_t unitFlag = 0b00;
@@ -365,7 +506,23 @@ void GemmNTile(
         MatrixCoord gmCoordC{mL1TileIdx * L1ATileShape::M, nBegin};
         auto gmTileC = gmBlockC[layoutC.GetOffset(gmCoordC)];
 
-        // 【核心修复】增加 L0C 到 GM 的安全同步
+        // While waiting/doing fixpipe, prefetch next m-tile k0 into free L1A.
+        if ((mL1TileIdx + 1 < mL1TileCount) && (L1A_STAGES > 1)) {
+            uint32_t nextMActual =
+                (mL1TileIdx + 1 < mL1TileCount - 1) ? L1ATileShape::M
+                                                   : (actualM - (mL1TileIdx + 1) * L1ATileShape::M);
+            uint32_t nextK0Actual = (kL1TileCount > 1) ? L1ATileShape::K : actualK;
+            MatrixCoord nextAGM{(mL1TileIdx + 1) * L1ATileShape::M, 0};
+            auto nextGmA = gmBlockA[layoutA.GetOffset(nextAGM)];
+            auto nextLayoutGm = layoutA.GetTileLayout(MakeCoord(nextMActual, nextK0Actual));
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
+            copyGmToL1A(l1ATensorList[l1AListId], nextGmA, layoutAInL1, nextLayoutGm);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1AListId]);
+            l1APrefetched = true;
+        }
+
+        // M_FIX before fixpipe: unit-flag alone does not keep the previous
+        // m-tile's atomic store visible before the next mad reuses L0C.
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[0]);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[0]);
 
@@ -381,8 +538,10 @@ void GemmNTile(
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
     } // end of mL1 loop
 
-    // 本N段的全部L1->L0B(MTE1)消费已完成（MTE1队列保序），允许下一N段覆盖写L1B
-    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+    if (!overlapFix) {
+        // 本N段的全部L1->L0B(MTE1)消费已完成（MTE1队列保序），允许下一N段覆盖写L1B
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+    }
 }
 
     CATLASS_DEVICE
@@ -538,6 +697,9 @@ protected:
     int32_t l0BEventList[L0AB_STAGES];
     int32_t l0CEventList[L0C_STAGES];
     int32_t mmadSyncEventId{0};
+    bool flagsReady{false};
+    // sync=false left the last fixpipe's FIX_M unwaited.
+    bool fixInFlight{false};
 
     uint32_t l1AListId{0};
     uint32_t l0AListId{0};
